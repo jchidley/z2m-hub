@@ -395,7 +395,7 @@ const HOME_PAGE: &str = r#"<!DOCTYPE html>
     position: absolute;
     bottom: 0;
     width: 100%;
-    background: linear-gradient(to top, #0066cc, #3399ff);
+    background: linear-gradient(to top, #cc2200, #ff4433);
     transition: height 1s ease;
     border-radius: 0 0 7px 7px;
   }
@@ -406,7 +406,7 @@ const HOME_PAGE: &str = r#"<!DOCTYPE html>
   .hw-status.empty { color: #ff4444; }
   .hw-status.low { color: #ffaa00; }
   .hw-status.ok { color: #44cc44; }
-  .hw-status.full { color: #3399ff; }
+  .hw-status.full { color: #ff4433; }
   .hw-updated { font-size: 11px; color: #666; margin-top: 2px; }
 
   /* Lights */
