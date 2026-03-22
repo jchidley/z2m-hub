@@ -26,12 +26,25 @@ struct AutomationState {
     illuminance: std::collections::HashMap<String, f64>,
 }
 
+/// DHW tracking state
+struct DhwState {
+    /// Current remaining litres
+    remaining: f64,
+    /// Whether the heat pump is currently charging DHW
+    was_charging: bool,
+    /// Whether we initiated the current charge (via boost button)
+    boost_initiated: bool,
+    /// Volume register at last charge completion (for tracking usage)
+    volume_at_reset: f64,
+}
+
 /// Shared app state for axum handlers
 #[derive(Clone)]
 struct AppState {
     http_client: reqwest::Client,
     cmd_tx: broadcast::Sender<Z2mMessage>,
     z2m_state: Arc<Mutex<std::collections::HashMap<String, serde_json::Value>>>,
+    dhw_state: Arc<Mutex<DhwState>>,
 }
 
 const Z2M_WS_URL: &str = "ws://emonpi:8080/api";
@@ -43,6 +56,8 @@ const HTTP_PORT: u16 = 3030;
 const INFLUXDB_URL: &str = "http://localhost:8086";
 const INFLUXDB_TOKEN: &str = "jPTPrwcprKfDzt8IFr7gkn6shpBy15j8hFeyjLaBIaJ0IwcgQeXJ4LtrvVBJ5aIPYuzEfeDw5e-cmtAuvZ-Xmw==";
 const INFLUXDB_ORG: &str = "home";
+const DHW_FULL_LITRES: f64 = 161.0;
+const DHW_BOOST_PERCENT: f64 = 0.5;
 
 /// Motion sensor config: (name, illuminance threshold)
 const MOTION_SENSORS: &[(&str, f64)] = &[
@@ -71,14 +86,25 @@ async fn main() {
 
     let z2m_state = Arc::new(Mutex::new(std::collections::HashMap::<String, serde_json::Value>::new()));
 
+    let dhw_state = Arc::new(Mutex::new(DhwState {
+        remaining: 0.0, // Will be initialised from InfluxDB on first DHW poll
+        was_charging: false,
+        boost_initiated: false,
+        volume_at_reset: 0.0,
+    }));
+
     let app_state = AppState {
         http_client: reqwest::Client::new(),
         cmd_tx: cmd_tx.clone(),
         z2m_state: z2m_state.clone(),
+        dhw_state: dhw_state.clone(),
     };
 
     let timer_state = automation_state.clone();
     let timer_cmd_tx = cmd_tx.clone();
+
+    let dhw_client = app_state.http_client.clone();
+    let dhw_state_loop = dhw_state.clone();
 
     // Build axum router
     let app = axum::Router::new()
@@ -99,6 +125,9 @@ async fn main() {
         _ = z2m_connection_loop(automation_state, cmd_tx, z2m_state) => {
             error!("Z2M connection loop exited unexpectedly");
         }
+        _ = dhw_tracking_loop(dhw_state_loop, dhw_client) => {
+            error!("DHW tracking loop exited unexpectedly");
+        }
         result = async {
             let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{HTTP_PORT}")).await.unwrap();
             info!("HTTP server listening on port {HTTP_PORT}");
@@ -118,25 +147,11 @@ struct HotWaterResponse {
 }
 
 async fn api_hot_water(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let query = r#"from(bucket: "energy")
-  |> range(start: -24h)
-  |> filter(fn: (r) => r._measurement == "dhw" and r._field == "remaining_litres")
-  |> last()"#;
-
-    match query_influxdb(&state.http_client, query).await {
-        Ok((litres, timestamp)) => Json(serde_json::json!({
-            "remaining_litres": litres,
-            "timestamp": timestamp,
-            "ok": true
-        })),
-        Err(e) => {
-            error!("InfluxDB query failed: {e}");
-            Json(serde_json::json!({
-                "ok": false,
-                "error": e.to_string()
-            }))
-        }
-    }
+    let dhw = state.dhw_state.lock().await;
+    Json(serde_json::json!({
+        "remaining_litres": dhw.remaining,
+        "ok": true
+    }))
 }
 
 async fn query_influxdb(
@@ -270,11 +285,15 @@ async fn ebusd_command(cmd: &str) -> Result<String, Box<dyn std::error::Error + 
     Ok(buf.trim().to_string())
 }
 
-async fn api_dhw_boost() -> Json<serde_json::Value> {
+async fn api_dhw_boost(State(state): State<AppState>) -> Json<serde_json::Value> {
     // HwcSFMode "load" = one-shot cylinder charge, reverts to auto when done
     match ebusd_command("write -c 700 HwcSFMode load").await {
         Ok(resp) if resp == "done" => {
             info!("HTTP: DHW boost (HwcSFMode=load) requested");
+            {
+                let mut dhw = state.dhw_state.lock().await;
+                dhw.boost_initiated = true;
+            }
             Json(serde_json::json!({"ok": true}))
         }
         Ok(resp) => {
@@ -490,7 +509,7 @@ const HOME_PAGE: &str = r#"<!DOCTYPE html>
   </div>
 
 <script>
-const TANK_MAX = 200;
+const TANK_MAX = 161;
 const LIGHTS = ['landing', 'hall'];
 
 async function updateHotWater() {
@@ -593,6 +612,92 @@ setInterval(updateDhwStatus, 10000);
 </script>
 </body>
 </html>"#;
+
+// ── DHW tracking loop ───────────────────────────────────────────────────────
+
+async fn get_current_volume(client: &reqwest::Client) -> f64 {
+    let query = r#"from(bucket: "energy")
+  |> range(start: -1h)
+  |> filter(fn: (r) => r._measurement == "emon" and r._field == "value" and r.field == "dhw_volume_V1")
+  |> last()"#;
+    query_influxdb(client, query).await.map(|(v, _)| v).unwrap_or(0.0)
+}
+
+async fn write_remaining_to_influxdb(client: &reqwest::Client, litres: f64) {
+    let line = format!("dhw remaining_litres={litres}");
+    let result = client
+        .post(format!("{INFLUXDB_URL}/api/v2/write?org={INFLUXDB_ORG}&bucket=energy&precision=s"))
+        .header("Authorization", format!("Token {INFLUXDB_TOKEN}"))
+        .header("Content-Type", "text/plain")
+        .body(line)
+        .send()
+        .await;
+    match result {
+        Ok(resp) if resp.status().is_success() => {}
+        Ok(resp) => error!("InfluxDB write failed: {}", resp.status()),
+        Err(e) => error!("InfluxDB write error: {e}"),
+    }
+}
+
+async fn is_charging() -> bool {
+    let sfmode = ebusd_command("read -f -c 700 HwcSFMode").await.unwrap_or_default();
+    let status = ebusd_command("read -f -c hmu Status01").await.unwrap_or_default();
+    status.ends_with(";hwc") || sfmode == "load"
+}
+
+async fn dhw_tracking_loop(state: Arc<Mutex<DhwState>>, client: reqwest::Client) {
+    // Initialise from InfluxDB
+    {
+        let query = r#"from(bucket: "energy")
+  |> range(start: -24h)
+  |> filter(fn: (r) => r._measurement == "dhw" and r._field == "remaining_litres")
+  |> last()"#;
+        let remaining = query_influxdb(&client, query).await.map(|(v, _)| v).unwrap_or(0.0);
+        let volume = get_current_volume(&client).await;
+        let charging = is_charging().await;
+
+        let mut s = state.lock().await;
+        s.remaining = remaining;
+        s.volume_at_reset = volume;
+        s.was_charging = charging;
+        info!("DHW init: remaining={remaining:.1}L, volume={volume:.1}, charging={charging}");
+    }
+
+    let mut interval = tokio::time::interval(Duration::from_secs(10));
+    loop {
+        interval.tick().await;
+
+        let charging = is_charging().await;
+        let volume_now = get_current_volume(&client).await;
+
+        let mut s = state.lock().await;
+
+        if s.was_charging && !charging {
+            // Charging just ended
+            if s.boost_initiated {
+                // Manual boost: add 50%, cap at max
+                let add = DHW_FULL_LITRES * DHW_BOOST_PERCENT;
+                s.remaining = (s.remaining + add).min(DHW_FULL_LITRES);
+                info!("DHW boost complete: +{add:.0}L → {:.0}L", s.remaining);
+                s.boost_initiated = false;
+            } else {
+                // Scheduled charge: full tank
+                s.remaining = DHW_FULL_LITRES;
+                info!("DHW charge complete: reset to {DHW_FULL_LITRES:.0}L");
+            }
+            s.volume_at_reset = volume_now;
+            write_remaining_to_influxdb(&client, s.remaining).await;
+        } else if !charging && volume_now > s.volume_at_reset {
+            // Water being used (volume register increased)
+            let drawn = volume_now - s.volume_at_reset;
+            s.remaining = (DHW_FULL_LITRES - drawn).max(0.0).min(s.remaining);
+            // Only write periodically when usage changes
+            write_remaining_to_influxdb(&client, s.remaining).await;
+        }
+
+        s.was_charging = charging;
+    }
+}
 
 // ── Timer loop ──────────────────────────────────────────────────────────────
 
