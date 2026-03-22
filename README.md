@@ -1,6 +1,35 @@
 # z2m-hub
 
-[Your project description here]
+Rust server for home automation. Connects to Zigbee2MQTT via WebSocket and a Vaillant heat pump via eBUS. Serves a mobile dashboard for controlling lights and hot water.
+
+## Quick Start
+
+```bash
+# Build for Raspberry Pi 5
+cargo build --release --target aarch64-unknown-linux-gnu
+
+# Deploy
+scp target/aarch64-unknown-linux-gnu/release/z2m-hub jack@pi5data:/tmp/z2m-hub
+ssh jack@pi5data 'sudo mv /tmp/z2m-hub /usr/local/bin/z2m-hub && sudo systemctl restart z2m-hub'
+
+# Dashboard
+open http://10.0.1.230:3030
+```
+
+## What It Does
+
+- **Motion → lights**: Two Aqara motion sensors trigger hall and landing lights when dark enough (illuminance ≤ 15 lx). Auto-off after 60 seconds.
+- **Hot water gauge**: Shows remaining litres from a 161L cylinder, tracked via Multical heat meter volume register.
+- **DHW boost**: One-tap button sends a charge request to the heat pump via eBUS. Shows return temperature while heating.
+- **Light toggles**: On/off toggles for hall and landing SONOFF ZBMINI switches.
+
+## Documentation
+
+- [`AGENTS.md`](AGENTS.md) — LLM context (device list, API reference, infrastructure details)
+- [`docs/code-truth/`](docs/code-truth/) — Code-derived documentation:
+  - [Overview & Map](docs/code-truth/REPO_OVERVIEW.md) — what's where, how to navigate
+  - [Architecture](docs/code-truth/ARCHITECTURE.md) — data flows, implicit contracts
+  - [Decisions](docs/code-truth/DECISIONS.md) — why things are the way they are
 
 ## About This Code
 
