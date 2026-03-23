@@ -50,7 +50,7 @@ struct AppState {
 const Z2M_WS_URL: &str = "ws://emonpi:8080/api";
 const LIGHTS: &[&str] = &["landing", "hall", "top_landing"];
 const MOTION_LIGHTS: &[&str] = &["landing", "hall"];
-const OFF_DELAY: Duration = Duration::from_secs(60);
+const OFF_DELAY: Duration = Duration::from_secs(300);
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 const HTTP_PORT: u16 = 3030;
 
@@ -849,6 +849,18 @@ async fn handle_z2m_message(
                         } else {
                             info!("Motion on {topic} (lux={lux}, threshold={threshold}) — too bright, skipping");
                         }
+                    }
+                }
+            }
+        }
+        // Detect manual off on a motion light — cancel automation timer
+        topic if MOTION_LIGHTS.contains(&topic) => {
+            if let Some(state_val) = msg.payload.get("state").and_then(|v| v.as_str()) {
+                if state_val == "OFF" {
+                    let mut s = state.lock().await;
+                    if s.lights_off_at.is_some() {
+                        s.lights_off_at = None;
+                        info!("Manual OFF on {topic} — automation cancelled");
                     }
                 }
             }
