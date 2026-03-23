@@ -48,7 +48,8 @@ struct AppState {
 }
 
 const Z2M_WS_URL: &str = "ws://emonpi:8080/api";
-const LIGHTS: &[&str] = &["landing", "hall"];
+const LIGHTS: &[&str] = &["landing", "hall", "top_landing"];
+const MOTION_LIGHTS: &[&str] = &["landing", "hall"];
 const OFF_DELAY: Duration = Duration::from_secs(60);
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 const HTTP_PORT: u16 = 3030;
@@ -510,7 +511,7 @@ const HOME_PAGE: &str = r#"<!DOCTYPE html>
 
 <script>
 const TANK_MAX = 161;
-const LIGHTS = ['landing', 'hall'];
+const LIGHTS = ['landing', 'hall', 'top_landing'];
 
 async function updateHotWater() {
   try {
@@ -708,9 +709,9 @@ async fn timer_loop(state: Arc<Mutex<AutomationState>>, cmd_tx: broadcast::Sende
         let mut s = state.lock().await;
         if let Some(off_at) = s.lights_off_at {
             if Instant::now() >= off_at {
-                info!("Timer expired — turning OFF {LIGHTS:?}");
+                info!("Timer expired — turning OFF {MOTION_LIGHTS:?}");
                 s.lights_off_at = None;
-                for light in LIGHTS {
+                for light in MOTION_LIGHTS {
                     let msg = Z2mMessage {
                         topic: format!("{light}/set"),
                         payload: serde_json::json!({"state": "OFF"}),
@@ -833,9 +834,9 @@ async fn handle_z2m_message(
                     } else {
                         let lux = s.illuminance.get(topic).copied().unwrap_or(0.0);
                         if lux <= threshold {
-                            info!("Motion on {topic} (lux={lux}, threshold={threshold}) — turning ON {LIGHTS:?}");
+                            info!("Motion on {topic} (lux={lux}, threshold={threshold}) — turning ON {MOTION_LIGHTS:?}");
 
-                            for light in LIGHTS {
+                            for light in MOTION_LIGHTS {
                                 let on_msg = Z2mMessage {
                                     topic: format!("{light}/set"),
                                     payload: serde_json::json!({"state": "ON"}),
@@ -844,7 +845,7 @@ async fn handle_z2m_message(
                             }
 
                             s.lights_off_at = Some(Instant::now() + OFF_DELAY);
-                            info!("Scheduled {LIGHTS:?} OFF in {OFF_DELAY:?}");
+                            info!("Scheduled {MOTION_LIGHTS:?} OFF in {OFF_DELAY:?}");
                         } else {
                             info!("Motion on {topic} (lux={lux}, threshold={threshold}) — too bright, skipping");
                         }
