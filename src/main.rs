@@ -22,6 +22,8 @@ struct Z2mMessage {
 struct AutomationState {
     /// When the lights should turn off (None = not scheduled)
     lights_off_at: Option<Instant>,
+    /// When manual override expires (None = automation active)
+    suppressed_until: Option<Instant>,
     /// Last known illuminance per motion sensor
     illuminance: std::collections::HashMap<String, f64>,
 }
@@ -79,6 +81,7 @@ async fn main() {
 
     let automation_state = Arc::new(Mutex::new(AutomationState {
         lights_off_at: None,
+        suppressed_until: None,
         illuminance: std::collections::HashMap::new(),
     }));
 
@@ -826,9 +829,18 @@ async fn handle_z2m_message(
                 }
             }
 
+            // Clear expired suppression
+            if let Some(until) = s.suppressed_until {
+                if Instant::now() >= until {
+                    s.suppressed_until = None;
+                }
+            }
+
             if let Some(occupancy) = msg.payload.get("occupancy").and_then(|v| v.as_bool()) {
                 if occupancy {
-                    if s.lights_off_at.is_some() {
+                    if s.suppressed_until.is_some() {
+                        // Automation suppressed by manual override — ignore motion
+                    } else if s.lights_off_at.is_some() {
                         s.lights_off_at = Some(Instant::now() + OFF_DELAY);
                         info!("Motion on {topic} — lights already on, reset timer");
                     } else {
@@ -853,14 +865,15 @@ async fn handle_z2m_message(
                 }
             }
         }
-        // Detect manual off on a motion light — cancel automation timer
+        // Detect manual off on a motion light — cancel automation + suppress re-trigger
         topic if MOTION_LIGHTS.contains(&topic) => {
             if let Some(state_val) = msg.payload.get("state").and_then(|v| v.as_str()) {
                 if state_val == "OFF" {
                     let mut s = state.lock().await;
                     if s.lights_off_at.is_some() {
                         s.lights_off_at = None;
-                        info!("Manual OFF on {topic} — automation cancelled");
+                        s.suppressed_until = Some(Instant::now() + OFF_DELAY);
+                        info!("Manual OFF on {topic} — automation suppressed for {OFF_DELAY:?}");
                     }
                 }
             }
