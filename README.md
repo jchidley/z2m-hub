@@ -18,10 +18,10 @@ open http://10.0.1.230:3030
 
 ## What It Does
 
-- **Motion → lights**: Two Aqara motion sensors trigger hall and landing lights when dark enough (illuminance ≤ 15 lx). Auto-off after 60 seconds.
+- **Motion → lights**: Two Aqara motion sensors trigger hall and landing lights when dark enough (illuminance ≤ 15 lx). Auto-off after 5 minutes. Manual switch-off cancels the automation.
 - **Hot water gauge**: Shows remaining litres from a 161L cylinder, tracked via Multical heat meter volume register.
 - **DHW boost**: One-tap button sends a charge request to the heat pump via eBUS. Shows return temperature while heating.
-- **Light toggles**: On/off toggles for hall and landing SONOFF ZBMINI switches.
+- **Light toggles**: On/off toggles for hall, landing, and top landing SONOFF ZBMINI switches.
 
 ## Documentation
 

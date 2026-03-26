@@ -1,10 +1,10 @@
 # Architecture
 
-<!-- code-truth: 8313d95 -->
+<!-- code-truth: 3c35351 -->
 
 ## Runtime Structure
 
-`main()` launches four concurrent tasks via `tokio::select!`:
+`main()` launches five concurrent tasks via `tokio::select!`:
 
 ```
 tokio::select! {
@@ -35,19 +35,32 @@ All tasks share state through `Arc<Mutex<T>>`:
 - **ebusd TCP protocol is line-based.** Send `command\n`, read until EOF. The `ebusd_command()` function calls `shutdown()` after writing to signal end-of-request. If ebusd changes to keep connections alive, this will break.
 - **InfluxDB CSV response format.** `query_influxdb()` parses CSV with `_value` and `_time` columns. If InfluxDB changes column ordering or naming, parsing breaks silently (returns 0.0).
 - **Multical volume register (`dhw_volume_V1`) is monotonically increasing.** DHW tracking subtracts `volume_at_reset` from current. If the register wraps or resets, remaining will go negative (clamped to 0).
-- **`StatuscodeNum == 134`** in ebusd_poll means DHW charge active. The old Flux task used this. z2m-hub now uses `HwcSFMode` + `Status01` pumpstate instead, which is more direct.
 
 ## Data Flow: Motion → Lights
 
 ```
-Aqara sensor (Zigbee) → Z2M → WebSocket message {topic: "landing_motion", payload: {occupancy: true, illuminance: 15}}
+Aqara sensor (Zigbee) → Z2M → WebSocket message
   → handle_z2m_message()
-    → check: is topic in MOTION_SENSORS? yes
-    → check: lights already on? if yes → just reset timer
-    → check: illuminance ≤ threshold? (only sampled when lights off)
-    → if yes → send Z2mMessage to broadcast channel → WebSocket writer → Z2M → Zigbee → ZBMINI relay
-    → set lights_off_at = now + 60s
+    → topic in MOTION_SENSORS? yes
+    → lights already on (lights_off_at set)? → just reset timer to 5min
+    → illuminance ≤ threshold? (only sampled when lights off)
+    → send ON to each MOTION_LIGHT via broadcast channel → Z2M → Zigbee → ZBMINI
+    → set lights_off_at = now + 300s
 ```
+
+### Manual Override
+
+If a MOTION_LIGHT reports state OFF while `lights_off_at` is set (timer active), the automation cancels:
+
+```
+Physical switch or dashboard toggle → light OFF
+  → Z2M pushes state update → handle_z2m_message()
+    → topic in MOTION_LIGHTS? yes
+    → state == "OFF" && lights_off_at is Some?
+    → lights_off_at = None (automation cancelled)
+```
+
+This works because the timer loop sets `lights_off_at = None` before sending its own OFF commands, so the Z2M confirmation arriving after a timer-triggered OFF won't re-cancel (it's already None).
 
 ## Data Flow: DHW Tracking
 
@@ -74,12 +87,11 @@ dhw_tracking_loop (every 10s):
 POST /api/lights/landing/toggle
   → read z2m_state["landing"]["state"] → "OFF"
   → new_state = "ON"
-  → send Z2mMessage{topic: "landing/set", payload: {"state": "ON"}} via broadcast channel
-  → return {"ok": true, "state": "ON"} (immediate, doesn't wait for Z2M confirmation)
-  → Z2M WebSocket writer picks up message, sends to Z2M
-  → Z2M sends to device, then pushes state update back
-  → z2m_connection_loop receives update, stores in z2m_state
+  → send Z2mMessage via broadcast channel
+  → return {"ok": true, "state": "ON"} (immediate, optimistic)
+  → Z2M WebSocket writer sends to Z2M → device
+  → Z2M pushes state update back → stored in z2m_state
   → next /api/lights poll (5s) picks up confirmed state
 ```
 
-**Note:** Toggle response is optimistic — it returns the intended state before Z2M confirms. The UI updates immediately from the response, then background polling catches the real state. If Z2M or the device is unreachable, the toggle will appear to work but the next poll will show the old state.
+**Note:** Toggle response is optimistic — returns intended state before Z2M confirms. If device is unreachable, the next poll (5s) shows the old state.

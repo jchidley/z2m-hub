@@ -1,12 +1,12 @@
 # Repository Overview & Map
 
-<!-- code-truth: 8313d95 -->
+<!-- code-truth: 3c35351 -->
 
 ## Purpose
 
 Single-binary Rust server replacing Home Assistant for a LAN-only Zigbee + heat pump setup. Three responsibilities:
 
-1. **Zigbee automations** — motion sensors → lights, with illuminance gating
+1. **Zigbee automations** — motion sensors → lights, with illuminance gating and manual override
 2. **Heat pump DHW control** — boost button + remaining hot water tracking
 3. **Mobile dashboard** — embedded HTML served on port 3030
 
@@ -20,11 +20,12 @@ Single-binary Rust server replacing Home Assistant for a LAN-only Zigbee + heat 
 ## File Organisation
 
 ```
-src/main.rs           ← entire application (857 lines, single file)
+src/main.rs           ← entire application (870 lines, single file)
 Cargo.toml            ← dependencies
 .cargo/config.toml    ← aarch64 cross-compile linker config
 vendor/zigbee2mqtt/   ← submodule pinned to 2.9.1 (reference only)
 AGENTS.md             ← LLM context (comprehensive, kept current)
+docs/code-truth/      ← code-derived documentation (this directory)
 ```
 
 ### Navigating main.rs
@@ -43,7 +44,7 @@ The file is organised in labelled sections:
 | `dhw_tracking_loop()` | Polls ebusd every 10s, detects charge transitions, tracks volume | Change DHW logic |
 | `timer_loop()` | 1s tick, checks light off timers | Change light timing |
 | `z2m_connection_loop()` | WebSocket connect/reconnect, message dispatch | Change Z2M connection handling |
-| `handle_z2m_message()` | Routes Z2M messages to automation logic | Add new automations, handle new device types |
+| `handle_z2m_message()` | Routes Z2M messages to automation logic + manual override detection | Add new automations, handle new device types |
 
 ### Where things are configured
 
@@ -51,10 +52,18 @@ The file is organised in labelled sections:
 |---------|----------|---------------|
 | Z2M URL | `const Z2M_WS_URL` | `ws://emonpi:8080/api` |
 | HTTP port | `const HTTP_PORT` | `3030` |
-| Light names | `const LIGHTS` | `["landing", "hall"]` |
+| All toggleable lights | `const LIGHTS` | `["landing", "hall", "top_landing"]` |
+| Motion-triggered lights | `const MOTION_LIGHTS` | `["landing", "hall"]` |
 | Motion sensors + thresholds | `const MOTION_SENSORS` | `[("landing_motion", 15.0), ("hall_motion", 15.0)]` |
-| Light off delay | `const OFF_DELAY` | `60s` |
+| Light off delay | `const OFF_DELAY` | `300s` (5 minutes) |
 | Tank capacity | `const DHW_FULL_LITRES` | `161.0` |
 | Boost refill | `const DHW_BOOST_PERCENT` | `0.5` (50%) |
 | InfluxDB URL/token/org | `const INFLUXDB_*` | Hardcoded (LAN-only) |
 | ebusd host/port | `const EBUSD_*` | `localhost:8888` |
+
+### Key distinction: LIGHTS vs MOTION_LIGHTS
+
+`LIGHTS` = all lights with dashboard toggles (landing, hall, top_landing).
+`MOTION_LIGHTS` = subset triggered by motion sensors (landing, hall only).
+
+top_landing has a dashboard toggle but is not linked to any motion sensor. To add a new light to the dashboard only, add to `LIGHTS`. To also link it to motion, add to `MOTION_LIGHTS`.

@@ -80,12 +80,24 @@ read -f -c hmu Status01           → "43.0;39.5;-;-;-;hwc"
 | landing | ZBMINI (SONOFF) | Router/Switch | ✅ Active (debounce 0.5s) |
 | hall | ZBMINI (SONOFF) | Router/Switch | ✅ Active (debounce 0.5s) |
 | kitchen | ZBMINI (SONOFF) | Router/Switch | ✅ Active |
-| landing_motion | RTCGQ14LM (Aqara) | Motion sensor | ✅ Active (62-77% batt) |
+| top_landing | ZBMINI (SONOFF) | Router/Switch | ✅ Active |
+| landing_motion | RTCGQ14LM (Aqara) | Motion sensor | ✅ Active |
 | hall_motion | RTCGQ14LM (Aqara) | Motion sensor | ✅ Active (100% batt) |
-| bathroom_temp_humid | SNZB-02P (SONOFF) | Temp/humidity | ✅ Re-paired Mar 2026 |
-| conservatory_temp_humid | SNZB-02P (SONOFF) | Temp/humidity | ✅ Active |
-| shower_temp_humid | SNZB-02P (SONOFF) | Temp/humidity | ✅ Active |
-| front_temp_humid | SNZB-02P (SONOFF) | Temp/humidity | ❌ Dead battery |
+| bathroom_temp_humid | SNZB-02P (SONOFF) | Temp/humidity | ✅ Active (v2.2.0) |
+| conservatory_temp_humid | SNZB-02P (SONOFF) | Temp/humidity | ✅ Active (v2.2.0, 38% batt) |
+| shower_temp_humid | SNZB-02P (SONOFF) | Temp/humidity | ✅ Active (v2.2.0) |
+| front_temp_humid | SNZB-02P (SONOFF) | Temp/humidity | ✅ Active (v2.2.0) |
+| kitchen_temp_humid | SNZB-02P (SONOFF) | Temp/humidity | ✅ Active (v2.2.0) |
+| hall_temp_humid | SNZB-02P (SONOFF) | Temp/humidity | ✅ Active (v2.2.0) |
+| Sterling_temp_humid | SNZB-02P (SONOFF) | Temp/humidity | ✅ Active (v2.2.0) |
+| jackcarol_temp_humid | SNZB-02P (SONOFF) | Temp/humidity | ✅ Active (v2.2.0) |
+| elvina_temp_humid | SNZB-02P (SONOFF) | Temp/humidity | ✅ Active (v2.2.0) |
+| aldora_temp_humid | SNZB-02P (SONOFF) | Temp/humidity | ✅ Active (v2.2.0) |
+| landing_temp_humid | SNZB-02P (SONOFF) | Temp/humidity | ✅ Added Mar 2026 (v2.2.0) |
+| office_temp_humid | SNZB-02P (SONOFF) | Temp/humidity | ✅ Added Mar 2026 |
+| washing_machine | S60ZBTPG (SONOFF) | Smart plug (energy) | ✅ Active — 0W standby, ~0.73 kWh/cycle |
+| plusnet_router | S60ZBTPG (SONOFF) | Smart plug (energy) | ✅ Active — 9.2W constant |
+| pi4_router | S60ZBTPG (SONOFF) | Smart plug (energy) | ✅ Active — 4.2W constant |
 
 ## Automations
 
@@ -93,9 +105,11 @@ All automations run in the Rust server (z2m-hub.service on pi5data). Previous sh
 
 ### Motion → Lights
 - **Sensors**: landing_motion, hall_motion
-- **Lights**: landing, hall (both triggered by either sensor)
+- **Motion lights** (`MOTION_LIGHTS`): landing, hall (both triggered by either sensor)
+- **Dashboard-only lights** (`LIGHTS`): landing, hall, top_landing (top_landing not motion-linked)
 - **Illuminance thresholds**: landing_motion ≤ 15 lx, hall_motion ≤ 15 lx
-- **Behaviour**: motion ON → lights ON, 60s auto-off timer, re-trigger resets timer
+- **Behaviour**: motion ON → motion lights ON, 5 min auto-off timer, re-trigger resets timer
+- **Manual override**: switching a motion light OFF (physical switch or dashboard) while timer is active cancels the automation
 - **Light-aware**: illuminance only sampled when lights are off (avoids self-inflation from switched-on lights boosting sensor readings by ~5-6 lx)
 
 ### DHW Tracking
