@@ -11,6 +11,81 @@ use tokio::sync::{broadcast, Mutex};
 use tokio::time::Instant;
 use tracing::{error, info, warn};
 
+/// DHW configuration loaded from z2m-hub.toml
+#[derive(Debug, Clone, Deserialize)]
+struct DhwConfig {
+    /// Usable litres from a full charge at 45°C
+    full_litres: f64,
+    /// T1 decay rate in standby (°C/h)
+    t1_decay_rate: f64,
+    /// Below this T1, capacity starts scaling down
+    reduced_t1: f64,
+    /// HwcStorage crash threshold during draw (°C drop)
+    hwc_crash_threshold: f64,
+    /// Volume above HwcStorage sensor (litres)
+    vol_above_hwc: f64,
+    /// Minimum draw flow rate (L/h)
+    draw_flow_min: f64,
+    /// Gap threshold for sharp thermocline (°C)
+    gap_sharp: f64,
+    /// Gap threshold for dissolved thermocline (°C)
+    gap_dissolved: f64,
+    /// Minimum sane full_litres from InfluxDB autoload
+    #[serde(default = "default_full_litres_min")]
+    full_litres_min: f64,
+    /// Maximum sane full_litres from InfluxDB autoload
+    #[serde(default = "default_full_litres_max")]
+    full_litres_max: f64,
+}
+
+fn default_full_litres_min() -> f64 { 160.0 }
+fn default_full_litres_max() -> f64 { 220.0 }
+
+#[derive(Debug, Clone, Deserialize)]
+struct HubConfig {
+    dhw: DhwConfig,
+}
+
+impl HubConfig {
+    fn load(path: &str) -> Self {
+        match std::fs::read_to_string(path) {
+            Ok(contents) => match toml::from_str(&contents) {
+                Ok(config) => {
+                    info!("Loaded config from {path}");
+                    config
+                }
+                Err(e) => {
+                    error!("Failed to parse {path}: {e}, using defaults");
+                    Self::default()
+                }
+            },
+            Err(e) => {
+                warn!("Config file {path} not found ({e}), using defaults");
+                Self::default()
+            }
+        }
+    }
+
+    fn default() -> Self {
+        Self {
+            dhw: DhwConfig {
+                full_litres: 177.0,
+                t1_decay_rate: 0.25,
+                reduced_t1: 42.0,
+                hwc_crash_threshold: 5.0,
+                vol_above_hwc: 148.0,
+                draw_flow_min: 100.0,
+                gap_sharp: 3.5,
+                gap_dissolved: 1.5,
+                full_litres_min: 160.0,
+                full_litres_max: 220.0,
+            },
+        }
+    }
+}
+
+const CONFIG_PATH: &str = "/etc/z2m-hub.toml";
+
 /// Z2M WebSocket message format
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Z2mMessage {
@@ -28,16 +103,77 @@ struct AutomationState {
     illuminance: std::collections::HashMap<String, f64>,
 }
 
-/// DHW tracking state
+/// DHW charge/discharge state label
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum DhwChargeState {
+    /// Fully charged (crossover achieved, T1 ≥ 43°C)
+    Full,
+    /// Partially charged (no crossover or low T1)
+    Partial,
+    /// Standing idle, decaying
+    Standby,
+    /// Currently charging — below-T1 heating phase
+    ChargingBelow,
+    /// Currently charging — uniform heating phase (post-crossover)
+    ChargingUniform,
+}
+
+impl std::fmt::Display for DhwChargeState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Full => write!(f, "full"),
+            Self::Partial => write!(f, "partial"),
+            Self::Standby => write!(f, "standby"),
+            Self::ChargingBelow => write!(f, "charging_below"),
+            Self::ChargingUniform => write!(f, "charging_uniform"),
+        }
+    }
+}
+
+/// DHW tracking state — physics-based model per dhw-cylinder-analysis.md
 struct DhwState {
-    /// Current remaining litres
+    /// Runtime full capacity (config value, possibly upgraded by InfluxDB autoload)
+    full_litres: f64,
+    /// Current remaining usable litres
     remaining: f64,
-    /// Whether the heat pump is currently charging DHW
-    was_charging: bool,
-    /// Whether we initiated the current charge (via boost button)
-    boost_initiated: bool,
     /// Volume register at last charge completion (for tracking usage)
     volume_at_reset: f64,
+
+    // ── Crossover tracking ──
+    /// T1 when charge started (the threshold HwcStorage must reach)
+    t1_at_charge_start: f64,
+    /// Whether HwcStorage crossed T1_at_charge_start during this charge
+    crossover_achieved: bool,
+
+    // ── Post-charge state ──
+    /// T1 at the moment charging ended
+    t1_at_charge_end: f64,
+    /// HwcStorageTemp at the moment charging ended
+    hwc_at_charge_end: f64,
+    /// When the last charge ended (for standby decay)
+    charge_end_time: Option<std::time::Instant>,
+    /// Temperature-decayed effective T1 (drops 0.25°C/h in standby)
+    effective_t1: f64,
+
+    // ── Draw tracking ──
+    /// HwcStorageTemp at the start of the current draw sequence
+    hwc_pre_draw: f64,
+    /// Whether we've detected the HwcStorage crash (>5°C drop during draw)
+    hwc_crash_detected: bool,
+    /// T1 at the start of the current draw sequence
+    t1_pre_draw: f64,
+    /// Whether a draw is currently active
+    drawing: bool,
+
+    // ── Cached sensor readings ──
+    current_t1: f64,
+    current_hwc: f64,
+
+    // ── Flags ──
+    was_charging: bool,
+    boost_initiated: bool,
+    charge_state: DhwChargeState,
 }
 
 /// Shared app state for axum handlers
@@ -47,6 +183,7 @@ struct AppState {
     cmd_tx: broadcast::Sender<Z2mMessage>,
     z2m_state: Arc<Mutex<std::collections::HashMap<String, serde_json::Value>>>,
     dhw_state: Arc<Mutex<DhwState>>,
+    config: Arc<HubConfig>,
 }
 
 const Z2M_WS_URL: &str = "ws://emonpi:8080/api";
@@ -60,8 +197,7 @@ const INFLUXDB_URL: &str = "http://localhost:8086";
 const INFLUXDB_TOKEN: &str =
     "jPTPrwcprKfDzt8IFr7gkn6shpBy15j8hFeyjLaBIaJ0IwcgQeXJ4LtrvVBJ5aIPYuzEfeDw5e-cmtAuvZ-Xmw==";
 const INFLUXDB_ORG: &str = "home";
-const DHW_FULL_LITRES: f64 = 161.0;
-const DHW_BOOST_PERCENT: f64 = 0.5;
+
 
 /// Motion sensor config: (name, illuminance threshold)
 const MOTION_SENSORS: &[(&str, f64)] = &[("landing_motion", 15.0), ("hall_motion", 15.0)];
@@ -91,11 +227,28 @@ async fn main() {
         serde_json::Value,
     >::new()));
 
+    let config = Arc::new(HubConfig::load(CONFIG_PATH));
+    info!("DHW config: full_litres={}", config.dhw.full_litres);
+
     let dhw_state = Arc::new(Mutex::new(DhwState {
-        remaining: 0.0, // Will be initialised from InfluxDB on first DHW poll
+        full_litres: config.dhw.full_litres,
+        remaining: 0.0,
+        volume_at_reset: 0.0,
+        t1_at_charge_start: 0.0,
+        crossover_achieved: false,
+        t1_at_charge_end: 0.0,
+        hwc_at_charge_end: 0.0,
+        charge_end_time: None,
+        effective_t1: 0.0,
+        hwc_pre_draw: 0.0,
+        hwc_crash_detected: false,
+        t1_pre_draw: 0.0,
+        drawing: false,
+        current_t1: 0.0,
+        current_hwc: 0.0,
         was_charging: false,
         boost_initiated: false,
-        volume_at_reset: 0.0,
+        charge_state: DhwChargeState::Standby,
     }));
 
     let app_state = AppState {
@@ -103,6 +256,7 @@ async fn main() {
         cmd_tx: cmd_tx.clone(),
         z2m_state: z2m_state.clone(),
         dhw_state: dhw_state.clone(),
+        config: config.clone(),
     };
 
     let timer_state = automation_state.clone();
@@ -140,7 +294,7 @@ async fn main() {
         _ = z2m_connection_loop(automation_state, cmd_tx, z2m_state) => {
             error!("Z2M connection loop exited unexpectedly");
         }
-        _ = dhw_tracking_loop(dhw_state_loop, dhw_client) => {
+        _ = dhw_tracking_loop(dhw_state_loop, dhw_client, config.clone()) => {
             error!("DHW tracking loop exited unexpectedly");
         }
         result = async {
@@ -155,16 +309,16 @@ async fn main() {
 
 // ── HTTP handlers ───────────────────────────────────────────────────────────
 
-#[derive(Serialize)]
-struct HotWaterResponse {
-    remaining_litres: f64,
-    timestamp: String,
-}
-
 async fn api_hot_water(State(state): State<AppState>) -> Json<serde_json::Value> {
     let dhw = state.dhw_state.lock().await;
     Json(serde_json::json!({
         "remaining_litres": dhw.remaining,
+        "full_litres": dhw.full_litres,
+        "effective_t1": dhw.effective_t1,
+        "charge_state": dhw.charge_state,
+        "crossover_achieved": dhw.crossover_achieved,
+        "t1": dhw.current_t1,
+        "hwc_storage": dhw.current_hwc,
         "ok": true
     }))
 }
@@ -425,8 +579,14 @@ const HOME_PAGE: &str = r#"<!DOCTYPE html>
     bottom: 0;
     width: 100%;
     background: linear-gradient(to top, #cc2200, #ff4433);
-    transition: height 1s ease;
+    transition: height 1s ease, background 1s ease;
     border-radius: 0 0 7px 7px;
+  }
+  .water.cool {
+    background: linear-gradient(to top, #2255aa, #4488cc);
+  }
+  .water.warm {
+    background: linear-gradient(to top, #cc8800, #ffaa33);
   }
   .hw-info { display: flex; flex-direction: column; }
   .litres { font-size: 40px; font-weight: 700; }
@@ -589,7 +749,7 @@ const HOME_PAGE: &str = r#"<!DOCTYPE html>
   </div>
 
 <script>
-const TANK_MAX = 161;
+let TANK_MAX = 177; // updated from API on first poll
 const LIGHTS = ['landing', 'hall', 'top_landing'];
 
 async function updateHotWater() {
@@ -597,15 +757,30 @@ async function updateHotWater() {
     const r = await fetch('/api/hot-water');
     const d = await r.json();
     if (!d.ok) return;
+    if (d.full_litres) TANK_MAX = d.full_litres;
     const litres = Math.round(d.remaining_litres);
     const pct = Math.min(100, Math.max(0, (litres / TANK_MAX) * 100));
     document.getElementById('litres').textContent = litres;
-    document.getElementById('water').style.height = pct + '%';
+    const waterEl = document.getElementById('water');
+    waterEl.style.height = pct + '%';
+    // Colour by effective temperature: hot (≥42) → warm (38–42) → cool (<38)
+    const et = d.effective_t1 || 0;
+    waterEl.classList.remove('cool', 'warm');
+    if (et > 0 && et < 38) waterEl.classList.add('cool');
+    else if (et >= 38 && et < 42) waterEl.classList.add('warm');
     const el = document.getElementById('hw-status');
-    if (litres <= 0) { el.textContent = 'Empty'; el.className = 'hw-status empty'; }
-    else if (litres < 40) { el.textContent = 'Low'; el.className = 'hw-status low'; }
+    const cs = d.charge_state || '';
+    if (cs === 'charging_below') { el.textContent = 'Heating below'; el.className = 'hw-status low'; }
+    else if (cs === 'charging_uniform') { el.textContent = 'Heating uniformly'; el.className = 'hw-status ok'; }
+    else if (litres <= 0) { el.textContent = 'Empty'; el.className = 'hw-status empty'; }
+    else if (litres < 40 || (d.effective_t1 && d.effective_t1 < 42)) { el.textContent = 'Low'; el.className = 'hw-status low'; }
     else if (litres < 150) { el.textContent = 'OK'; el.className = 'hw-status ok'; }
+    else if (cs === 'partial') { el.textContent = 'Partial'; el.className = 'hw-status ok'; }
     else { el.textContent = 'Full'; el.className = 'hw-status full'; }
+    // Stale indicator: standby with ~ prefix
+    if (cs === 'standby' && litres > 0) {
+      document.getElementById('litres').textContent = '~' + litres;
+    }
     if (d.timestamp) {
       const t = new Date(d.timestamp);
       document.getElementById('hw-updated').textContent = 'Updated ' + t.toLocaleTimeString();
@@ -674,7 +849,7 @@ async function updateDhwStatus() {
       btn.textContent = 'Boosting…';
       btn.className = 'boost-btn charging';
       let parts = [];
-      if (d.cylinder_temp > 0) parts.push('Cyl ' + d.cylinder_temp.toFixed(1) + '°C');
+      if (d.cylinder_temp > 0) parts.push('Lower ' + d.cylinder_temp.toFixed(1) + '°C');
       if (d.t1_hot > 0) parts.push('Top ' + d.t1_hot.toFixed(1) + '°C');
       info.textContent = parts.join(' · ') || d.return_temp + '°C';
     } else {
@@ -682,7 +857,7 @@ async function updateDhwStatus() {
       btn.className = 'boost-btn';
       let parts = [];
       if (d.t1_hot > 0) parts.push('Top ' + d.t1_hot.toFixed(1) + '°C');
-      if (d.cylinder_temp > 0) parts.push('Cyl ' + d.cylinder_temp.toFixed(1) + '°C');
+      if (d.cylinder_temp > 0) parts.push('Lower ' + d.cylinder_temp.toFixed(1) + '°C');
       info.textContent = parts.join(' · ');
     }
   } catch(e) { console.error(e); }
@@ -804,7 +979,7 @@ async fn api_heating_kill(State(state): State<AppState>) -> Json<serde_json::Val
     }
 }
 
-// ── DHW tracking loop ───────────────────────────────────────────────────────
+// ── DHW tracking loop (physics-based model) ────────────────────────────────
 
 async fn get_current_volume(client: &reqwest::Client) -> f64 {
     let query = r#"from(bucket: "energy")
@@ -817,8 +992,59 @@ async fn get_current_volume(client: &reqwest::Client) -> f64 {
         .unwrap_or(0.0)
 }
 
-async fn write_remaining_to_influxdb(client: &reqwest::Client, litres: f64) {
-    let line = format!("dhw remaining_litres={litres}");
+async fn get_current_t1(client: &reqwest::Client) -> f64 {
+    let query = r#"from(bucket: "energy")
+  |> range(start: -1h)
+  |> filter(fn: (r) => r._measurement == "emon" and r._field == "value" and r.field == "dhw_t1")
+  |> last()"#;
+    query_influxdb(client, query)
+        .await
+        .map(|(v, _)| v)
+        .unwrap_or(0.0)
+}
+
+async fn get_current_dhw_flow(client: &reqwest::Client) -> f64 {
+    let query = r#"from(bucket: "energy")
+  |> range(start: -5m)
+  |> filter(fn: (r) => r._measurement == "emon" and r._field == "value" and r.field == "dhw_flow")
+  |> last()"#;
+    query_influxdb(client, query)
+        .await
+        .map(|(v, _)| v)
+        .unwrap_or(0.0)
+}
+
+async fn get_hwc_storage_temp() -> f64 {
+    ebusd_command("read -f -c 700 HwcStorageTemp")
+        .await
+        .unwrap_or_default()
+        .parse()
+        .unwrap_or(0.0)
+}
+
+async fn is_charging() -> bool {
+    let sfmode = ebusd_command("read -f -c 700 HwcSFMode")
+        .await
+        .unwrap_or_default();
+    let status = ebusd_command("read -f -c hmu Status01")
+        .await
+        .unwrap_or_default();
+    status.ends_with(";hwc") || sfmode == "load"
+}
+
+async fn write_dhw_to_influxdb(client: &reqwest::Client, s: &DhwState) {
+    let line = format!(
+        "dhw remaining_litres={:.1},model_version=2i,t1={:.2},hwc_storage={:.2},\
+         effective_t1={:.2},charge_state=\"{}\",crossover={},bottom_zone_hot={}",
+        s.remaining,
+        s.current_t1,
+        s.current_hwc,
+        s.effective_t1,
+        s.charge_state,
+        s.crossover_achieved,
+        // Bottom zone is "hot" when HwcStorage is significantly above mains (~20°C)
+        s.current_hwc > 30.0,
+    );
     let result = client
         .post(format!(
             "{INFLUXDB_URL}/api/v2/write?org={INFLUXDB_ORG}&bucket=energy&precision=s"
@@ -835,18 +1061,98 @@ async fn write_remaining_to_influxdb(client: &reqwest::Client, litres: f64) {
     }
 }
 
-async fn is_charging() -> bool {
-    let sfmode = ebusd_command("read -f -c 700 HwcSFMode")
-        .await
-        .unwrap_or_default();
-    let status = ebusd_command("read -f -c hmu Status01")
-        .await
-        .unwrap_or_default();
-    status.ends_with(";hwc") || sfmode == "load"
+/// Apply standby decay: T1 drops at configured rate, mark standby below reduced_t1
+fn apply_standby_decay(s: &mut DhwState, cfg: &DhwConfig) {
+    if let Some(end_time) = s.charge_end_time {
+        let hours = end_time.elapsed().as_secs_f64() / 3600.0;
+        s.effective_t1 = s.t1_at_charge_end - cfg.t1_decay_rate * hours;
+
+        // Below reduced_t1, don't reduce remaining — the water is still there,
+        // just lukewarm. The SPA shows colour (blue/amber/red) for temperature.
+        // Only mark as standby.
+        if s.effective_t1 < cfg.reduced_t1 {
+            s.charge_state = DhwChargeState::Standby;
+        }
+
+        // Mark as standby after 2h
+        if hours > 2.0
+            && !matches!(
+                s.charge_state,
+                DhwChargeState::ChargingBelow | DhwChargeState::ChargingUniform
+            )
+        {
+            s.charge_state = DhwChargeState::Standby;
+        }
+    }
 }
 
-async fn dhw_tracking_loop(state: Arc<Mutex<DhwState>>, client: reqwest::Client) {
-    // Initialise from InfluxDB
+/// Determine remaining litres after a no-crossover charge ends.
+/// Uses the gap between T1 and HwcStorage to estimate thermocline state.
+fn apply_no_crossover_charge(s: &mut DhwState, cfg: &DhwConfig, t1_now: f64, hwc_now: f64) {
+    let gap = t1_now - hwc_now;
+    let full = s.full_litres;
+    info!(
+        "DHW no-crossover charge ended: T1={t1_now:.1}, HwcS={hwc_now:.1}, gap={gap:.1}"
+    );
+
+    if gap < cfg.gap_dissolved {
+        // Thermocline dissolved — effectively full but at a lower temperature
+        s.remaining = full;
+        s.charge_state = DhwChargeState::Full;
+        info!("  Gap <{:.1}°C → thermocline dissolved, full at lower temp", cfg.gap_dissolved);
+    } else if gap > cfg.gap_sharp {
+        // Sharp thermocline — remaining unchanged from before charge
+        s.charge_state = DhwChargeState::Partial;
+        info!(
+            "  Gap >{:.1}°C → sharp thermocline, remaining unchanged at {:.0}L",
+            cfg.gap_sharp, s.remaining
+        );
+    } else {
+        // Intermediate: interpolate between unchanged and full
+        let frac = (cfg.gap_sharp - gap) / (cfg.gap_sharp - cfg.gap_dissolved);
+        let interpolated = s.remaining + frac * (full - s.remaining);
+        s.remaining = interpolated;
+        s.charge_state = DhwChargeState::Partial;
+        info!(
+            "  Gap {gap:.1}°C → interpolated frac={frac:.2}, remaining={interpolated:.0}L"
+        );
+    }
+}
+
+async fn dhw_tracking_loop(
+    state: Arc<Mutex<DhwState>>,
+    client: reqwest::Client,
+    config: Arc<HubConfig>,
+) {
+    let cfg = &config.dhw;
+
+    // Autoload recommended capacity from InfluxDB (written by dhw-inflection-detector.py)
+    {
+        let query = r#"from(bucket: "energy")
+  |> range(start: -90d)
+  |> filter(fn: (r) => r._measurement == "dhw_capacity" and r._field == "recommended_full_litres")
+  |> last()"#;
+        if let Ok((recommended, _)) = query_influxdb(&client, query).await {
+            if recommended >= cfg.full_litres_min && recommended <= cfg.full_litres_max {
+                let mut s = state.lock().await;
+                let prev = s.full_litres;
+                s.full_litres = s.full_litres.max(recommended);
+                info!(
+                    "DHW autoload: recommended={recommended:.0}L, \
+                     config={prev:.0}L → using {:.0}L",
+                    s.full_litres
+                );
+            } else if recommended > 0.0 {
+                warn!(
+                    "DHW autoload: recommended={recommended:.0}L outside sane range \
+                     [{:.0}, {:.0}], ignoring",
+                    cfg.full_litres_min, cfg.full_litres_max
+                );
+            }
+        }
+    }
+
+    // Initialise remaining from InfluxDB
     {
         let query = r#"from(bucket: "energy")
   |> range(start: -24h)
@@ -858,44 +1164,176 @@ async fn dhw_tracking_loop(state: Arc<Mutex<DhwState>>, client: reqwest::Client)
             .unwrap_or(0.0);
         let volume = get_current_volume(&client).await;
         let charging = is_charging().await;
+        let t1 = get_current_t1(&client).await;
+        let hwc = get_hwc_storage_temp().await;
 
         let mut s = state.lock().await;
         s.remaining = remaining;
-        s.volume_at_reset = volume;
+        // Reconstruct volume_at_reset: if 66L drawn from full, the reset
+        // point was 66L before the current register reading
+        let already_drawn = (s.full_litres - remaining).max(0.0);
+        s.volume_at_reset = volume - already_drawn;
         s.was_charging = charging;
-        info!("DHW init: remaining={remaining:.1}L, volume={volume:.1}, charging={charging}");
+        s.current_t1 = t1;
+        s.current_hwc = hwc;
+        s.effective_t1 = t1; // Best guess on startup
+        s.t1_at_charge_end = t1;
+        // If we're already charging on startup, capture T1 for crossover detection
+        if charging {
+            s.t1_at_charge_start = t1;
+            s.charge_state = DhwChargeState::ChargingBelow;
+        }
+        info!(
+            "DHW init: remaining={remaining:.1}L, full={:.0}L, volume={volume:.1}, \
+             T1={t1:.1}, HwcS={hwc:.1}, charging={charging}",
+            s.full_litres
+        );
     }
 
     let mut interval = tokio::time::interval(Duration::from_secs(10));
     loop {
         interval.tick().await;
 
+        // Read all sensors
         let charging = is_charging().await;
         let volume_now = get_current_volume(&client).await;
+        let t1_now = get_current_t1(&client).await;
+        let hwc_now = get_hwc_storage_temp().await;
+        let dhw_flow = get_current_dhw_flow(&client).await;
 
         let mut s = state.lock().await;
+        let full = s.full_litres;
+
+        // Update cached sensor values
+        s.current_t1 = t1_now;
+        s.current_hwc = hwc_now;
+
+        // ── Charging state machine ──────────────────────────────────────
+
+        if charging && !s.was_charging {
+            // Charge just started
+            s.t1_at_charge_start = t1_now;
+            s.crossover_achieved = false;
+            s.charge_state = DhwChargeState::ChargingBelow;
+            info!(
+                "DHW charge started: T1={t1_now:.1}, HwcS={hwc_now:.1}, \
+                 crossover target={t1_now:.1}"
+            );
+        }
+
+        if charging {
+            // Monitor for crossover: HwcStorage reaches T1 at charge start
+            if !s.crossover_achieved && hwc_now >= s.t1_at_charge_start {
+                s.crossover_achieved = true;
+                s.charge_state = DhwChargeState::ChargingUniform;
+                info!(
+                    "DHW CROSSOVER achieved: HwcS={hwc_now:.1} ≥ T1_start={:.1}",
+                    s.t1_at_charge_start
+                );
+            }
+        }
 
         if s.was_charging && !charging {
-            // Charging just ended
-            if s.boost_initiated {
-                // Manual boost: add 50%, cap at max
-                let add = DHW_FULL_LITRES * DHW_BOOST_PERCENT;
-                s.remaining = (s.remaining + add).min(DHW_FULL_LITRES);
-                info!("DHW boost complete: +{add:.0}L → {:.0}L", s.remaining);
-                s.boost_initiated = false;
+            // ── Charge just ended ───────────────────────────────────────
+            s.t1_at_charge_end = t1_now;
+            s.hwc_at_charge_end = hwc_now;
+            s.charge_end_time = Some(std::time::Instant::now());
+            s.effective_t1 = t1_now;
+
+            if s.crossover_achieved {
+                // Full charge: crossover means entire cylinder at/above T1_start
+                s.remaining = full;
+                s.charge_state = DhwChargeState::Full;
+                info!(
+                    "DHW charge complete (crossover): T1={t1_now:.1}, HwcS={hwc_now:.1} \
+                     → {full:.0}L"
+                );
             } else {
-                // Scheduled charge: full tank
-                s.remaining = DHW_FULL_LITRES;
-                info!("DHW charge complete: reset to {DHW_FULL_LITRES:.0}L");
+                // No crossover: use gap-based thermocline model
+                apply_no_crossover_charge(&mut s, cfg, t1_now, hwc_now);
             }
+
             s.volume_at_reset = volume_now;
-            write_remaining_to_influxdb(&client, s.remaining).await;
-        } else if !charging && volume_now > s.volume_at_reset {
-            // Water being used (volume register increased)
+            s.boost_initiated = false;
+            s.hwc_crash_detected = false;
+            write_dhw_to_influxdb(&client, &s).await;
+        }
+
+        // ── Draw detection and tracking ─────────────────────────────────
+
+        let is_drawing = !charging && dhw_flow > cfg.draw_flow_min;
+
+        if is_drawing && !s.drawing {
+            // Draw just started
+            s.drawing = true;
+            s.hwc_pre_draw = hwc_now;
+            s.t1_pre_draw = t1_now;
+            s.hwc_crash_detected = false;
+            info!("DHW draw started: T1={t1_now:.1}, HwcS={hwc_now:.1}");
+        }
+
+        if !charging && volume_now > s.volume_at_reset {
+            // Volume being drawn — subtract from remaining
             let drawn = volume_now - s.volume_at_reset;
-            s.remaining = (DHW_FULL_LITRES - drawn).max(0.0).min(s.remaining);
-            // Only write periodically when usage changes
-            write_remaining_to_influxdb(&client, s.remaining).await;
+            let remaining_by_volume = (full - drawn).max(0.0);
+            // Take the worse of volume-based and current remaining
+            s.remaining = s.remaining.min(remaining_by_volume);
+
+            // ── Temperature-based overrides during draw ─────────────────
+            if s.drawing {
+                // HwcStorage crash: thermocline reached 600mm sensor
+                let hwc_drop = s.hwc_pre_draw - hwc_now;
+                if hwc_drop > cfg.hwc_crash_threshold && !s.hwc_crash_detected {
+                    s.hwc_crash_detected = true;
+                    // Cap remaining at volume above HwcStorage
+                    let cap = cfg.vol_above_hwc;
+                    if s.remaining > cap {
+                        info!(
+                            "DHW HwcS crash ({hwc_drop:.1}°C): capping remaining \
+                             {:.0} → {cap:.0}L",
+                            s.remaining
+                        );
+                        s.remaining = cap;
+                    }
+                }
+
+                // T1 dropping = thermocline at draw-off height
+                let t1_drop = s.t1_pre_draw - t1_now;
+                if t1_drop > 1.5 {
+                    if s.remaining > 0.0 {
+                        info!("DHW T1 crashed {t1_drop:.1}°C: remaining → 0");
+                    }
+                    s.remaining = 0.0;
+                } else if t1_drop > 0.5 {
+                    let cap = 20.0;
+                    if s.remaining > cap {
+                        info!(
+                            "DHW T1 dropping {t1_drop:.1}°C: capping remaining \
+                             {:.0} → {cap:.0}L",
+                            s.remaining
+                        );
+                        s.remaining = cap;
+                    }
+                }
+            }
+
+            write_dhw_to_influxdb(&client, &s).await;
+        }
+
+        if s.drawing && !is_drawing {
+            // Draw ended
+            s.drawing = false;
+            info!(
+                "DHW draw ended: remaining={:.0}L, T1={t1_now:.1}, HwcS={hwc_now:.1}",
+                s.remaining
+            );
+            write_dhw_to_influxdb(&client, &s).await;
+        }
+
+        // ── Standby decay ───────────────────────────────────────────────
+
+        if !charging && !s.drawing {
+            apply_standby_decay(&mut s, cfg);
         }
 
         s.was_charging = charging;

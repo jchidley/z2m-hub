@@ -1,0 +1,23 @@
+# z2m-hub configuration
+
+[dhw]
+# Usable litres from a full charge at 45°C (measured inflection range 177–183L)
+full_litres = 177.0
+# T1 decay rate in standby (°C per hour), measured σ=0.02 over 20 observations
+t1_decay_rate = 0.25
+# Below this T1, capacity starts scaling down (water is lukewarm)
+reduced_t1 = 42.0
+# HwcStorage crash threshold during draw (°C drop)
+hwc_crash_threshold = 5.0
+# Volume above HwcStorage sensor (geometry: 600→1530mm)
+vol_above_hwc = 148.0
+# Minimum draw flow rate to count as active draw (L/h)
+draw_flow_min = 100.0
+# Crossover gap thresholds (°C)
+gap_sharp = 3.5
+gap_dissolved = 1.5
+# Sane range for autoloaded full_litres from InfluxDB
+full_litres_min = 160.0
+full_litres_max = 220.0
+# WWHR adjustment is calculated by dhw-inflection-detector.py and
+# written to InfluxDB (dhw_capacity measurement). z2m-hub reads it on startup.
