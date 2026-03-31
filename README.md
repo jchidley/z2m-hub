@@ -19,8 +19,8 @@ open http://10.0.1.230:3030
 ## What It Does
 
 - **Motion → lights**: Two Aqara motion sensors trigger hall and landing lights when dark enough (illuminance ≤ 15 lx). Auto-off after 5 minutes. Manual switch-off cancels the automation.
-- **Hot water gauge**: Shows remaining litres from a 161L cylinder, tracked via Multical heat meter volume register.
-- **DHW boost**: One-tap button sends a charge request to the heat pump via eBUS. Shows return temperature while heating.
+- **Hot water gauge**: Physics-based DHW model tracking remaining litres from a 300L cylinder (177L usable). Uses crossover detection, thermocline tracking, T1/HwcStorage sensors, and standby decay. Config in `/etc/z2m-hub.toml`, capacity autoloaded from InfluxDB inflection data.
+- **DHW boost**: One-tap button sends a charge request to the heat pump via eBUS. Shows Top/Lower cylinder temperatures.
 - **Light toggles**: On/off toggles for hall, landing, and top landing SONOFF ZBMINI switches.
 
 ## Documentation

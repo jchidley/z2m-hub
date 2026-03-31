@@ -112,22 +112,27 @@ All automations run in the Rust server (z2m-hub.service on pi5data). Previous sh
 - **Manual override**: switching a motion light OFF (physical switch or dashboard) while timer is active cancels the automation
 - **Light-aware**: illuminance only sampled when lights are off (avoids self-inflation from switched-on lights boosting sensor readings by ~5-6 lx)
 
-### DHW Tracking
-- Polls ebusd every 10s for charge status (HwcSFMode + Status01 pumpstate)
-- **Scheduled charge completes** → reset to 161L (full tank)
-- **Manual boost completes** → +50% (80.5L), capped at 161L
-- **Water usage** → tracked via Multical volume register (emon/multical/dhw_volume_V1)
-- Writes `remaining_litres` to InfluxDB measurement `dhw` for Grafana
-- Previous InfluxDB Flux task ("DHW Remaining Litres") disabled — had null crash edge case
+### DHW Tracking (v0.2.0 physics-based model)
+- Config in `/etc/z2m-hub.toml` (source: `z2m-hub.toml` in repo)
+- Polls ebusd + InfluxDB every 10s: charge status, T1, HwcStorageTemp, dhw_flow, volume register
+- **Crossover detection**: during charge, watches for HwcStorage ≥ T1_at_charge_start
+- **Charge with crossover** → remaining = full_litres (177L default, autoloaded from InfluxDB)
+- **Charge without crossover** → gap-based thermocline model (dissolved < 1.5°C / sharp > 3.5°C / interpolated)
+- **Draw tracking**: volume subtraction + temperature overrides:
+  - HwcStorage crash (>5°C drop) → cap at 148L (volume above sensor)
+  - T1 drop >0.5°C → cap at 20L; T1 drop >1.5°C → remaining = 0
+- **Standby decay**: effective_t1 = T1_at_charge_end − 0.25°C/h
+- **Capacity autoload**: reads `dhw_capacity/recommended_full_litres` from InfluxDB on startup (written by `dhw-inflection-detector.py` weekly cron on pi5data)
+- Writes to InfluxDB measurement `dhw`: remaining_litres, model_version, t1, hwc_storage, effective_t1, charge_state, crossover, bottom_zone_hot
 
 ## HTTP API (port 3030)
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/` | GET | Mobile dashboard (hot water gauge, boost button, light toggles) |
-| `/api/hot-water` | GET | `{remaining_litres, ok}` |
+| `/api/hot-water` | GET | `{remaining_litres, full_litres, effective_t1, charge_state, crossover_achieved, t1, hwc_storage, ok}` |
 | `/api/dhw/boost` | POST | Trigger DHW boost (HwcSFMode=load) |
-| `/api/dhw/status` | GET | `{charging, sfmode, t1, return_temp, target_temp, ok}` |
+| `/api/dhw/status` | GET | `{charging, sfmode, t1_hot, cylinder_temp, return_temp, target_temp, ok}` |
 | `/api/lights` | GET | `{lights: {name: {on: bool}}, ok}` |
 | `/api/lights/{name}/toggle` | POST | Toggle light, returns new state |
 | `/api/lights/{name}/on` | POST | Turn light on |
@@ -135,8 +140,8 @@ All automations run in the Rust server (z2m-hub.service on pi5data). Previous sh
 
 ### Mobile Dashboard
 - Optimised for iPhone SE (320px) portrait
-- Hot water: red tank gauge, litres remaining, status (Empty/Low/OK/Full)
-- DHW boost: one-tap button, shows "Boosting…" with pulsing animation while active, return temp while charging, T1 when idle
+- Hot water: tank gauge (red=hot, amber=warm, blue=cool), litres remaining, status (Empty/Low/OK/Full/Partial/Heating below/Heating uniformly), ~ prefix when stale
+- DHW boost: one-tap button, shows "Boosting…" with pulsing animation while active, Top + Lower temps
 - Lights: toggle switches with live state from Z2M (polls every 5s)
 - Access via `http://10.0.1.230:3030` (use IP, not hostname — Android ignores DHCP search domains)
 
