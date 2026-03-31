@@ -57,16 +57,14 @@ const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 const HTTP_PORT: u16 = 3030;
 
 const INFLUXDB_URL: &str = "http://localhost:8086";
-const INFLUXDB_TOKEN: &str = "jPTPrwcprKfDzt8IFr7gkn6shpBy15j8hFeyjLaBIaJ0IwcgQeXJ4LtrvVBJ5aIPYuzEfeDw5e-cmtAuvZ-Xmw==";
+const INFLUXDB_TOKEN: &str =
+    "jPTPrwcprKfDzt8IFr7gkn6shpBy15j8hFeyjLaBIaJ0IwcgQeXJ4LtrvVBJ5aIPYuzEfeDw5e-cmtAuvZ-Xmw==";
 const INFLUXDB_ORG: &str = "home";
 const DHW_FULL_LITRES: f64 = 161.0;
 const DHW_BOOST_PERCENT: f64 = 0.5;
 
 /// Motion sensor config: (name, illuminance threshold)
-const MOTION_SENSORS: &[(&str, f64)] = &[
-    ("landing_motion", 15.0),
-    ("hall_motion", 15.0),
-];
+const MOTION_SENSORS: &[(&str, f64)] = &[("landing_motion", 15.0), ("hall_motion", 15.0)];
 
 #[tokio::main]
 async fn main() {
@@ -88,7 +86,10 @@ async fn main() {
     // Channel for sending commands to Z2M
     let (cmd_tx, _) = broadcast::channel::<Z2mMessage>(64);
 
-    let z2m_state = Arc::new(Mutex::new(std::collections::HashMap::<String, serde_json::Value>::new()));
+    let z2m_state = Arc::new(Mutex::new(std::collections::HashMap::<
+        String,
+        serde_json::Value,
+    >::new()));
 
     let dhw_state = Arc::new(Mutex::new(DhwState {
         remaining: 0.0, // Will be initialised from InfluxDB on first DHW poll
@@ -116,10 +117,20 @@ async fn main() {
         .route("/api/hot-water", get(api_hot_water))
         .route("/api/lights/{name}/on", axum::routing::post(api_light_on))
         .route("/api/lights/{name}/off", axum::routing::post(api_light_off))
-        .route("/api/lights/{name}/toggle", axum::routing::post(api_light_toggle))
+        .route(
+            "/api/lights/{name}/toggle",
+            axum::routing::post(api_light_toggle),
+        )
         .route("/api/lights", get(api_lights_state))
         .route("/api/dhw/boost", axum::routing::post(api_dhw_boost))
         .route("/api/dhw/status", get(api_dhw_status))
+        .route("/api/heating/status", get(api_heating_status))
+        .route(
+            "/api/heating/mode/{mode}",
+            axum::routing::post(api_heating_mode),
+        )
+        .route("/api/heating/away", axum::routing::post(api_heating_away))
+        .route("/api/heating/kill", axum::routing::post(api_heating_kill))
         .with_state(app_state);
 
     tokio::select! {
@@ -267,7 +278,8 @@ async fn api_lights_state(State(state): State<AppState>) -> Json<serde_json::Val
     let zs = state.z2m_state.lock().await;
     let mut lights = serde_json::Map::new();
     for &name in LIGHTS {
-        let on = zs.get(name)
+        let on = zs
+            .get(name)
             .and_then(|v| v.get("state"))
             .and_then(|v| v.as_str())
             == Some("ON");
@@ -312,8 +324,12 @@ async fn api_dhw_boost(State(state): State<AppState>) -> Json<serde_json::Value>
 }
 
 async fn api_dhw_status(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let sfmode = ebusd_command("read -f -c 700 HwcSFMode").await.unwrap_or_default();
-    let status = ebusd_command("read -f -c hmu Status01").await.unwrap_or_default();
+    let sfmode = ebusd_command("read -f -c 700 HwcSFMode")
+        .await
+        .unwrap_or_default();
+    let status = ebusd_command("read -f -c hmu Status01")
+        .await
+        .unwrap_or_default();
     // Status01 format: "flow;return;outside;dhw;storage;pumpstate"
     // pumpstate: off/on/overrun/hwc
     let charging = status.ends_with(";hwc") || sfmode == "load";
@@ -330,15 +346,24 @@ async fn api_dhw_status(State(state): State<AppState>) -> Json<serde_json::Value
   |> range(start: -1h)
   |> filter(fn: (r) => r._measurement == "emon" and r._field == "value" and r.field == "dhw_t1")
   |> last()"#;
-    let t1 = query_influxdb(&state.http_client, t1_query).await
+    let t1 = query_influxdb(&state.http_client, t1_query)
+        .await
         .map(|(v, _)| v)
+        .unwrap_or(0.0);
+
+    // HwcStorageTemp — VR 10 NTC in cylinder dry pocket, above bottom coil
+    let cylinder_temp: f64 = ebusd_command("read -f -c 700 HwcStorageTemp")
+        .await
+        .unwrap_or_default()
+        .parse()
         .unwrap_or(0.0);
 
     Json(serde_json::json!({
         "ok": true,
         "charging": charging,
         "sfmode": sfmode,
-        "t1": t1,
+        "t1_hot": t1,
+        "cylinder_temp": cylinder_temp,
         "return_temp": return_temp,
         "target_temp": target_temp
     }))
@@ -485,6 +510,45 @@ const HOME_PAGE: &str = r#"<!DOCTYPE html>
     color: #666;
     margin-top: 6px;
   }
+
+  /* Heating */
+  .heating-mode {
+    font-size: 28px;
+    font-weight: 700;
+    text-transform: capitalize;
+    margin-bottom: 10px;
+  }
+  .heating-mode.occupied { color: #44cc44; }
+  .heating-mode.short_absence { color: #ffaa00; }
+  .heating-mode.away_until { color: #ff6633; }
+  .heating-mode.disabled { color: #666; }
+  .heating-mode.monitor_only { color: #6699ff; }
+  .heating-btns {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+  }
+  .mode-btn {
+    flex: 1;
+    min-width: 80px;
+    border: none;
+    border-radius: 12px;
+    padding: 10px 8px;
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+    background: #222;
+    color: #999;
+    transition: background 0.2s;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .mode-btn:active { background: #333; }
+  .mode-btn.active { background: #2a4a2a; color: #44cc44; }
+  .heating-away-info {
+    font-size: 13px;
+    color: #666;
+    margin-top: 6px;
+  }
 </style>
 </head>
 <body>
@@ -505,6 +569,18 @@ const HOME_PAGE: &str = r#"<!DOCTYPE html>
     <h2>🔥 Hot Water Boost</h2>
     <button class="boost-btn" id="boost-btn" onclick="boostDhw()">Boost</button>
     <div class="dhw-info" id="dhw-info"></div>
+  </div>
+
+  <div class="section">
+    <h2>🏠 Heating</h2>
+    <div class="heating-mode" id="heating-mode">—</div>
+    <div class="heating-btns">
+      <button class="mode-btn" id="hm-occupied" onclick="setHeatingMode('occupied')">Occupied</button>
+      <button class="mode-btn" id="hm-short-absence" onclick="setHeatingMode('short-absence')">Short Absence</button>
+      <button class="mode-btn" id="hm-disabled" onclick="setHeatingMode('disabled')">Disabled</button>
+    </div>
+    <div class="heating-away-info" id="heating-away-info"></div>
+    <button class="boost-btn" style="margin-top:8px;color:#ff4444" onclick="killHeating()">🛑 Kill / Restore Baseline</button>
   </div>
 
   <div class="section">
@@ -597,25 +673,136 @@ async function updateDhwStatus() {
     if (d.charging) {
       btn.textContent = 'Boosting…';
       btn.className = 'boost-btn charging';
-      info.textContent = d.return_temp + '°C';
+      let parts = [];
+      if (d.cylinder_temp > 0) parts.push('Cyl ' + d.cylinder_temp.toFixed(1) + '°C');
+      if (d.t1_hot > 0) parts.push('Top ' + d.t1_hot.toFixed(1) + '°C');
+      info.textContent = parts.join(' · ') || d.return_temp + '°C';
     } else {
       btn.textContent = 'Boost';
       btn.className = 'boost-btn';
-      info.textContent = d.t1 > 0 ? d.t1.toFixed(1) + '°C' : '';
+      let parts = [];
+      if (d.t1_hot > 0) parts.push('Top ' + d.t1_hot.toFixed(1) + '°C');
+      if (d.cylinder_temp > 0) parts.push('Cyl ' + d.cylinder_temp.toFixed(1) + '°C');
+      info.textContent = parts.join(' · ');
     }
   } catch(e) { console.error(e); }
+}
+
+// ── Heating MVP ──
+const HEATING_MODES = ['occupied', 'short-absence', 'disabled'];
+
+async function updateHeating() {
+  try {
+    const r = await fetch('/api/heating/status');
+    const d = await r.json();
+    if (!d.mode) return;
+    const el = document.getElementById('heating-mode');
+    const awayEl = document.getElementById('heating-away-info');
+    el.textContent = d.mode.replace('_', ' ');
+    el.className = 'heating-mode ' + d.mode;
+    if (d.away_until) {
+      const t = new Date(d.away_until);
+      awayEl.textContent = 'Return: ' + t.toLocaleString();
+    } else {
+      awayEl.textContent = d.last_reason || '';
+    }
+    HEATING_MODES.forEach(m => {
+      const btn = document.getElementById('hm-' + m);
+      if (btn) btn.className = (d.mode === m || d.mode === m.replace('-','_')) ? 'mode-btn active' : 'mode-btn';
+    });
+  } catch(e) { console.error(e); }
+}
+
+async function setHeatingMode(mode) {
+  await fetch('/api/heating/mode/' + mode, { method: 'POST' });
+  setTimeout(updateHeating, 500);
+}
+
+async function killHeating() {
+  if (!confirm('Restore baseline and disable controller?')) return;
+  await fetch('/api/heating/kill', { method: 'POST' });
+  setTimeout(updateHeating, 500);
 }
 
 buildLights();
 updateHotWater();
 updateLights();
 updateDhwStatus();
+updateHeating();
 setInterval(updateHotWater, 30000);
 setInterval(updateLights, 5000);
 setInterval(updateDhwStatus, 10000);
+setInterval(updateHeating, 15000);
 </script>
 </body>
 </html>"#;
+
+// ── Heating MVP proxy ────────────────────────────────────────────────────────
+
+const HEATING_MVP_URL: &str = "http://127.0.0.1:3031";
+
+async fn api_heating_status(State(state): State<AppState>) -> Json<serde_json::Value> {
+    match state
+        .http_client
+        .get(format!("{HEATING_MVP_URL}/status"))
+        .send()
+        .await
+    {
+        Ok(resp) => match resp.json::<serde_json::Value>().await {
+            Ok(v) => Json(v),
+            Err(e) => Json(serde_json::json!({"error": e.to_string()})),
+        },
+        Err(e) => Json(serde_json::json!({"error": e.to_string()})),
+    }
+}
+
+async fn api_heating_mode(
+    State(state): State<AppState>,
+    axum::extract::Path(mode): axum::extract::Path<String>,
+) -> Json<serde_json::Value> {
+    let url = format!("{HEATING_MVP_URL}/mode/{mode}");
+    match state.http_client.post(&url).send().await {
+        Ok(resp) => match resp.json::<serde_json::Value>().await {
+            Ok(v) => Json(v),
+            Err(e) => Json(serde_json::json!({"ok": false, "error": e.to_string()})),
+        },
+        Err(e) => Json(serde_json::json!({"ok": false, "error": e.to_string()})),
+    }
+}
+
+async fn api_heating_away(
+    State(state): State<AppState>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    match state
+        .http_client
+        .post(format!("{HEATING_MVP_URL}/mode/away"))
+        .json(&body)
+        .send()
+        .await
+    {
+        Ok(resp) => match resp.json::<serde_json::Value>().await {
+            Ok(v) => Json(v),
+            Err(e) => Json(serde_json::json!({"ok": false, "error": e.to_string()})),
+        },
+        Err(e) => Json(serde_json::json!({"ok": false, "error": e.to_string()})),
+    }
+}
+
+async fn api_heating_kill(State(state): State<AppState>) -> Json<serde_json::Value> {
+    match state
+        .http_client
+        .post(format!("{HEATING_MVP_URL}/kill"))
+        .send()
+        .await
+    {
+        Ok(resp) => match resp.json::<serde_json::Value>().await {
+            Ok(v) => Json(v),
+            Err(e) => Json(serde_json::json!({"ok": false, "error": e.to_string()})),
+        },
+        Err(e) => Json(serde_json::json!({"ok": false, "error": e.to_string()})),
+    }
+}
 
 // ── DHW tracking loop ───────────────────────────────────────────────────────
 
@@ -624,13 +811,18 @@ async fn get_current_volume(client: &reqwest::Client) -> f64 {
   |> range(start: -1h)
   |> filter(fn: (r) => r._measurement == "emon" and r._field == "value" and r.field == "dhw_volume_V1")
   |> last()"#;
-    query_influxdb(client, query).await.map(|(v, _)| v).unwrap_or(0.0)
+    query_influxdb(client, query)
+        .await
+        .map(|(v, _)| v)
+        .unwrap_or(0.0)
 }
 
 async fn write_remaining_to_influxdb(client: &reqwest::Client, litres: f64) {
     let line = format!("dhw remaining_litres={litres}");
     let result = client
-        .post(format!("{INFLUXDB_URL}/api/v2/write?org={INFLUXDB_ORG}&bucket=energy&precision=s"))
+        .post(format!(
+            "{INFLUXDB_URL}/api/v2/write?org={INFLUXDB_ORG}&bucket=energy&precision=s"
+        ))
         .header("Authorization", format!("Token {INFLUXDB_TOKEN}"))
         .header("Content-Type", "text/plain")
         .body(line)
@@ -644,8 +836,12 @@ async fn write_remaining_to_influxdb(client: &reqwest::Client, litres: f64) {
 }
 
 async fn is_charging() -> bool {
-    let sfmode = ebusd_command("read -f -c 700 HwcSFMode").await.unwrap_or_default();
-    let status = ebusd_command("read -f -c hmu Status01").await.unwrap_or_default();
+    let sfmode = ebusd_command("read -f -c 700 HwcSFMode")
+        .await
+        .unwrap_or_default();
+    let status = ebusd_command("read -f -c hmu Status01")
+        .await
+        .unwrap_or_default();
     status.ends_with(";hwc") || sfmode == "load"
 }
 
@@ -656,7 +852,10 @@ async fn dhw_tracking_loop(state: Arc<Mutex<DhwState>>, client: reqwest::Client)
   |> range(start: -24h)
   |> filter(fn: (r) => r._measurement == "dhw" and r._field == "remaining_litres")
   |> last()"#;
-        let remaining = query_influxdb(&client, query).await.map(|(v, _)| v).unwrap_or(0.0);
+        let remaining = query_influxdb(&client, query)
+            .await
+            .map(|(v, _)| v)
+            .unwrap_or(0.0);
         let volume = get_current_volume(&client).await;
         let charging = is_charging().await;
 
@@ -748,7 +947,10 @@ async fn z2m_connection_loop(
                         let text = serde_json::to_string(&msg).unwrap();
                         info!("Sending to Z2M: {text}");
                         let mut w = write_clone.lock().await;
-                        if let Err(e) = w.send(tokio_tungstenite::tungstenite::Message::Text(text.into())).await {
+                        if let Err(e) = w
+                            .send(tokio_tungstenite::tungstenite::Message::Text(text.into()))
+                            .await
+                        {
                             error!("WS write error: {e}");
                             break;
                         }
@@ -818,9 +1020,11 @@ async fn handle_z2m_message(
             }
         }
         topic if MOTION_SENSORS.iter().any(|(name, _)| *name == topic) => {
-            let threshold = MOTION_SENSORS.iter()
+            let threshold = MOTION_SENSORS
+                .iter()
                 .find(|(name, _)| *name == topic)
-                .unwrap().1;
+                .unwrap()
+                .1;
             let mut s = state.lock().await;
 
             if s.lights_off_at.is_none() {
