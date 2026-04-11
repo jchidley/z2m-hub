@@ -32,6 +32,8 @@ Key shared state is:
 
 The DHW loop now keeps more of its state transitions in small pure helpers such as charge completion and draw tracking, so the async polling shell stays thin while the high-value litre/temperature rules are unit-testable in isolation.
 
+Some interface glue also uses small pure helpers for deterministic parsing and response shaping, such as Influx CSV extraction and heating-proxy JSON wrapping, so the LAN client shells remain thin and auditable without introducing subprocesses or duplicate policy logic.
+
 The design assumes low enough contention that coarse mutexes are acceptable.
 
 ### Routing and UI ownership

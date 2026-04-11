@@ -47,9 +47,13 @@ struct HubConfig {
 }
 
 impl HubConfig {
+    fn parse(contents: &str) -> Result<Self, toml::de::Error> {
+        toml::from_str(contents)
+    }
+
     fn load(path: &str) -> Self {
         match std::fs::read_to_string(path) {
-            Ok(contents) => match toml::from_str(&contents) {
+            Ok(contents) => match Self::parse(&contents) {
                 Ok(config) => {
                     info!("Loaded config from {path}");
                     config
@@ -321,21 +325,7 @@ async fn api_hot_water(State(state): State<AppState>) -> Json<serde_json::Value>
     }))
 }
 
-async fn query_influxdb(
-    client: &reqwest::Client,
-    query: &str,
-) -> Result<(f64, String), Box<dyn std::error::Error + Send + Sync>> {
-    let resp = client
-        .post(format!("{INFLUXDB_URL}/api/v2/query?org={INFLUXDB_ORG}"))
-        .header("Authorization", format!("Token {INFLUXDB_TOKEN}"))
-        .header("Content-Type", "application/vnd.flux")
-        .header("Accept", "application/csv")
-        .body(query.to_string())
-        .send()
-        .await?;
-
-    let body = resp.text().await?;
-
+fn parse_influx_query_csv(body: &str) -> (f64, String) {
     // Parse CSV response — find the last row with _value
     let mut litres = 0.0;
     let mut timestamp = String::new();
@@ -366,7 +356,24 @@ async fn query_influxdb(
         }
     }
 
-    Ok((litres, timestamp))
+    (litres, timestamp)
+}
+
+async fn query_influxdb(
+    client: &reqwest::Client,
+    query: &str,
+) -> Result<(f64, String), Box<dyn std::error::Error + Send + Sync>> {
+    let resp = client
+        .post(format!("{INFLUXDB_URL}/api/v2/query?org={INFLUXDB_ORG}"))
+        .header("Authorization", format!("Token {INFLUXDB_TOKEN}"))
+        .header("Content-Type", "application/vnd.flux")
+        .header("Accept", "application/csv")
+        .body(query.to_string())
+        .send()
+        .await?;
+
+    let body = resp.text().await?;
+    Ok(parse_influx_query_csv(&body))
 }
 
 async fn api_light_on(
@@ -453,6 +460,19 @@ async fn ebusd_command(cmd: &str) -> Result<String, Box<dyn std::error::Error + 
     Ok(buf.trim().to_string())
 }
 
+fn parse_status01(status: &str, sfmode: &str) -> (bool, f64) {
+    // Status01 format: "flow;return;outside;dhw;storage;pumpstate"
+    // pumpstate: off/on/overrun/hwc
+    let charging = status.ends_with(";hwc") || sfmode == "load";
+    let return_temp = status
+        .split(';')
+        .nth(1)
+        .unwrap_or("0")
+        .parse()
+        .unwrap_or(0.0);
+    (charging, return_temp)
+}
+
 async fn api_dhw_boost(State(state): State<AppState>) -> Json<serde_json::Value> {
     // HwcSFMode "load" = one-shot cylinder charge, reverts to auto when done
     match ebusd_command("write -c 700 HwcSFMode load").await {
@@ -478,11 +498,7 @@ async fn api_dhw_status(State(state): State<AppState>) -> Json<serde_json::Value
     let status = ebusd_command("read -f -c hmu Status01")
         .await
         .unwrap_or_default();
-    // Status01 format: "flow;return;outside;dhw;storage;pumpstate"
-    // pumpstate: off/on/overrun/hwc
-    let charging = status.ends_with(";hwc") || sfmode == "load";
-    let parts: Vec<&str> = status.split(';').collect();
-    let return_temp: f64 = parts.get(1).unwrap_or(&"0").parse().unwrap_or(0.0);
+    let (charging, return_temp) = parse_status01(&status, &sfmode);
     let target_temp: f64 = ebusd_command("read -f -c 700 HwcTempDesired")
         .await
         .unwrap_or_default()
@@ -910,19 +926,36 @@ setInterval(updateHeating, 15000);
 
 const HEATING_MVP_URL: &str = "http://127.0.0.1:3031";
 
+fn heating_proxy_json(
+    result: Result<serde_json::Value, String>,
+    include_ok_false: bool,
+) -> serde_json::Value {
+    match result {
+        Ok(value) => value,
+        Err(error) => {
+            if include_ok_false {
+                serde_json::json!({"ok": false, "error": error})
+            } else {
+                serde_json::json!({"error": error})
+            }
+        }
+    }
+}
+
 async fn api_heating_status(State(state): State<AppState>) -> Json<serde_json::Value> {
-    match state
+    let result = match state
         .http_client
         .get(format!("{HEATING_MVP_URL}/status"))
         .send()
         .await
     {
-        Ok(resp) => match resp.json::<serde_json::Value>().await {
-            Ok(v) => Json(v),
-            Err(e) => Json(serde_json::json!({"error": e.to_string()})),
-        },
-        Err(e) => Json(serde_json::json!({"error": e.to_string()})),
-    }
+        Ok(resp) => resp
+            .json::<serde_json::Value>()
+            .await
+            .map_err(|e| e.to_string()),
+        Err(e) => Err(e.to_string()),
+    };
+    Json(heating_proxy_json(result, false))
 }
 
 async fn api_heating_mode(
@@ -930,47 +963,50 @@ async fn api_heating_mode(
     axum::extract::Path(mode): axum::extract::Path<String>,
 ) -> Json<serde_json::Value> {
     let url = format!("{HEATING_MVP_URL}/mode/{mode}");
-    match state.http_client.post(&url).send().await {
-        Ok(resp) => match resp.json::<serde_json::Value>().await {
-            Ok(v) => Json(v),
-            Err(e) => Json(serde_json::json!({"ok": false, "error": e.to_string()})),
-        },
-        Err(e) => Json(serde_json::json!({"ok": false, "error": e.to_string()})),
-    }
+    let result = match state.http_client.post(&url).send().await {
+        Ok(resp) => resp
+            .json::<serde_json::Value>()
+            .await
+            .map_err(|e| e.to_string()),
+        Err(e) => Err(e.to_string()),
+    };
+    Json(heating_proxy_json(result, true))
 }
 
 async fn api_heating_away(
     State(state): State<AppState>,
     Json(body): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
-    match state
+    let result = match state
         .http_client
         .post(format!("{HEATING_MVP_URL}/mode/away"))
         .json(&body)
         .send()
         .await
     {
-        Ok(resp) => match resp.json::<serde_json::Value>().await {
-            Ok(v) => Json(v),
-            Err(e) => Json(serde_json::json!({"ok": false, "error": e.to_string()})),
-        },
-        Err(e) => Json(serde_json::json!({"ok": false, "error": e.to_string()})),
-    }
+        Ok(resp) => resp
+            .json::<serde_json::Value>()
+            .await
+            .map_err(|e| e.to_string()),
+        Err(e) => Err(e.to_string()),
+    };
+    Json(heating_proxy_json(result, true))
 }
 
 async fn api_heating_kill(State(state): State<AppState>) -> Json<serde_json::Value> {
-    match state
+    let result = match state
         .http_client
         .post(format!("{HEATING_MVP_URL}/kill"))
         .send()
         .await
     {
-        Ok(resp) => match resp.json::<serde_json::Value>().await {
-            Ok(v) => Json(v),
-            Err(e) => Json(serde_json::json!({"ok": false, "error": e.to_string()})),
-        },
-        Err(e) => Json(serde_json::json!({"ok": false, "error": e.to_string()})),
-    }
+        Ok(resp) => resp
+            .json::<serde_json::Value>()
+            .await
+            .map_err(|e| e.to_string()),
+        Err(e) => Err(e.to_string()),
+    };
+    Json(heating_proxy_json(result, true))
 }
 
 // ── DHW tracking loop (physics-based model) ────────────────────────────────
@@ -1579,6 +1615,17 @@ mod tests {
         }))
     }
 
+    fn test_app_state() -> AppState {
+        let (cmd_tx, _) = broadcast::channel(8);
+        AppState {
+            http_client: reqwest::Client::new(),
+            cmd_tx,
+            z2m_state: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            dhw_state: Arc::new(Mutex::new(test_state())),
+            config: Arc::new(HubConfig::default()),
+        }
+    }
+
     // ── apply_no_crossover_charge tests ─────────────────────────────────
 
     // @lat: [[tests#DHW no crossover#Dissolved thermocline resets to full]]
@@ -1928,6 +1975,246 @@ mod tests {
         assert_eq!(s.charge_state, DhwChargeState::ChargingBelow);
     }
 
+    // ── Config and eBUS helper tests ─────────────────────────────────────
+
+    // @lat: [[tests#Config loading#Missing config file falls back to built in defaults]]
+    #[test]
+    fn missing_config_file_falls_back_to_built_in_defaults() {
+        let missing = format!("/tmp/z2m-hub-missing-{}-{}.toml", std::process::id(), Instant::now().elapsed().as_nanos());
+
+        let cfg = HubConfig::load(&missing);
+
+        assert_eq!(cfg.dhw.full_litres, 177.0);
+        assert_eq!(cfg.dhw.t1_decay_rate, 0.25);
+        assert_eq!(cfg.dhw.full_litres_min, 160.0);
+        assert_eq!(cfg.dhw.full_litres_max, 220.0);
+    }
+
+    // @lat: [[tests#Config loading#Partial config uses serde defaults for sane bounds]]
+    #[test]
+    fn partial_config_uses_serde_defaults_for_sane_bounds() {
+        let cfg = HubConfig::parse(
+            r#"[dhw]
+full_litres = 190.0
+t1_decay_rate = 0.4
+reduced_t1 = 41.5
+hwc_crash_threshold = 6.0
+vol_above_hwc = 150.0
+draw_flow_min = 120.0
+gap_sharp = 4.0
+gap_dissolved = 2.0
+"#,
+        )
+        .expect("config should parse");
+
+        assert_eq!(cfg.dhw.full_litres, 190.0);
+        assert_eq!(cfg.dhw.full_litres_min, 160.0);
+        assert_eq!(cfg.dhw.full_litres_max, 220.0);
+    }
+
+    // @lat: [[tests#Config loading#Invalid config falls back to built in defaults]]
+    #[test]
+    fn invalid_config_falls_back_to_built_in_defaults() {
+        let path = format!("/tmp/z2m-hub-invalid-{}-{}.toml", std::process::id(), Instant::now().elapsed().as_nanos());
+        std::fs::write(&path, "not = [valid toml").expect("write invalid config");
+
+        let cfg = HubConfig::load(&path);
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(cfg.dhw.full_litres, 177.0);
+        assert_eq!(cfg.dhw.gap_dissolved, 1.5);
+        assert_eq!(cfg.dhw.full_litres_min, 160.0);
+        assert_eq!(cfg.dhw.full_litres_max, 220.0);
+    }
+
+    // @lat: [[tests#eBUS interface#Status01 hwc suffix marks charging]]
+    #[test]
+    fn status01_hwc_suffix_marks_charging() {
+        let (charging, return_temp) = parse_status01("50.0;37.5;8.0;55.0;49.0;hwc", "auto");
+
+        assert!(charging);
+        assert_eq!(return_temp, 37.5);
+    }
+
+    // @lat: [[tests#eBUS interface#Sfmode load marks charging without hwc suffix]]
+    #[test]
+    fn sfmode_load_marks_charging_without_hwc_suffix() {
+        let (charging, return_temp) = parse_status01("50.0;36.0;8.0;55.0;49.0;off", "load");
+
+        assert!(charging);
+        assert_eq!(return_temp, 36.0);
+    }
+
+    // @lat: [[tests#eBUS interface#Malformed Status01 falls back to zero return temperature]]
+    #[test]
+    fn malformed_status01_falls_back_to_zero_return_temperature() {
+        let (charging, return_temp) = parse_status01("garbage", "auto");
+
+        assert!(!charging);
+        assert_eq!(return_temp, 0.0);
+    }
+
+    // ── Influx and heating helper tests ──────────────────────────────────
+
+    // @lat: [[tests#InfluxDB interface#Influx parser uses the last value row]]
+    #[test]
+    fn influx_parser_uses_the_last_value_row() {
+        let body = "#datatype,string,long,dateTime:RFC3339,double\n,result,table,_time,_value\n,,0,2026-04-10T10:00:00Z,41.5\n,,0,2026-04-10T10:05:00Z,42.75\n";
+
+        let (value, timestamp) = parse_influx_query_csv(body);
+
+        assert_eq!(value, 42.75);
+        assert_eq!(timestamp, "2026-04-10T10:05:00Z");
+    }
+
+    // @lat: [[tests#InfluxDB interface#Influx parser ignores comments and malformed values]]
+    #[test]
+    fn influx_parser_ignores_comments_and_malformed_values() {
+        let body = "#group,false,false,true,false\n#datatype,string,long,dateTime:RFC3339,double\n,result,table,_time,_value\n,,0,2026-04-10T10:00:00Z,40.0\n,,0,2026-04-10T10:05:00Z,not-a-number\n";
+
+        let (value, timestamp) = parse_influx_query_csv(body);
+
+        assert_eq!(value, 40.0);
+        assert_eq!(timestamp, "2026-04-10T10:05:00Z");
+    }
+
+    // @lat: [[tests#Heating proxy#Heating proxy passes success JSON through unchanged]]
+    #[test]
+    fn heating_proxy_passes_success_json_through_unchanged() {
+        let payload = serde_json::json!({"ok": true, "mode": "away"});
+
+        let relayed = heating_proxy_json(Ok(payload.clone()), true);
+
+        assert_eq!(relayed, payload);
+    }
+
+    // @lat: [[tests#Heating proxy#Heating mode style errors include ok false]]
+    #[test]
+    fn heating_proxy_mode_errors_include_ok_false() {
+        let relayed = heating_proxy_json(Err("transport failed".to_string()), true);
+
+        assert_eq!(
+            relayed,
+            serde_json::json!({"ok": false, "error": "transport failed"})
+        );
+    }
+
+    // @lat: [[tests#Heating proxy#Heating status style errors omit ok false]]
+    #[test]
+    fn heating_proxy_status_errors_omit_ok_false() {
+        let relayed = heating_proxy_json(Err("bad json".to_string()), false);
+
+        assert_eq!(relayed, serde_json::json!({"error": "bad json"}));
+    }
+
+    // ── HTTP handler tests ───────────────────────────────────────────────
+
+    // @lat: [[tests#HTTP API#Light toggle uses cached ON state to send OFF]]
+    #[tokio::test]
+    async fn light_toggle_uses_cached_on_state_to_send_off() {
+        let state = test_app_state();
+        let mut cmd_rx = state.cmd_tx.subscribe();
+        {
+            let mut zs = state.z2m_state.lock().await;
+            zs.insert("hall".to_string(), serde_json::json!({"state": "ON"}));
+        }
+
+        let Json(resp) = api_light_toggle(
+            State(state.clone()),
+            axum::extract::Path("hall".to_string()),
+        )
+        .await;
+
+        assert_eq!(resp["ok"], serde_json::json!(true));
+        assert_eq!(resp["light"], serde_json::json!("hall"));
+        assert_eq!(resp["state"], serde_json::json!("OFF"));
+
+        let msg = cmd_rx.try_recv().expect("toggle should publish a command");
+        assert_eq!(msg.topic, "hall/set");
+        assert_eq!(msg.payload, serde_json::json!({"state": "OFF"}));
+    }
+
+    // @lat: [[tests#HTTP API#Light toggle assumes OFF when cache is missing]]
+    #[tokio::test]
+    async fn light_toggle_assumes_off_when_cache_is_missing() {
+        let state = test_app_state();
+        let mut cmd_rx = state.cmd_tx.subscribe();
+
+        let Json(resp) = api_light_toggle(
+            State(state.clone()),
+            axum::extract::Path("landing".to_string()),
+        )
+        .await;
+
+        assert_eq!(resp["ok"], serde_json::json!(true));
+        assert_eq!(resp["light"], serde_json::json!("landing"));
+        assert_eq!(resp["state"], serde_json::json!("ON"));
+
+        let msg = cmd_rx.try_recv().expect("toggle should publish a command");
+        assert_eq!(msg.topic, "landing/set");
+        assert_eq!(msg.payload, serde_json::json!({"state": "ON"}));
+    }
+
+    // @lat: [[tests#HTTP API#Unknown light commands fail without publishing Zigbee traffic]]
+    #[tokio::test]
+    async fn unknown_light_command_fails_without_publishing() {
+        let state = test_app_state();
+        let mut cmd_rx = state.cmd_tx.subscribe();
+
+        let Json(resp) = api_light_on(
+            State(state.clone()),
+            axum::extract::Path("kitchen".to_string()),
+        )
+        .await;
+
+        assert_eq!(resp, serde_json::json!({"ok": false, "error": "unknown light"}));
+        assert!(cmd_rx.try_recv().is_err());
+    }
+
+    // @lat: [[tests#HTTP API#Lights state reports missing cache entries as off]]
+    #[tokio::test]
+    async fn lights_state_reports_missing_cache_entries_as_off() {
+        let state = test_app_state();
+        {
+            let mut zs = state.z2m_state.lock().await;
+            zs.insert("hall".to_string(), serde_json::json!({"state": "ON"}));
+        }
+
+        let Json(resp) = api_lights_state(State(state)).await;
+
+        assert_eq!(resp["ok"], serde_json::json!(true));
+        assert_eq!(resp["lights"]["hall"]["on"], serde_json::json!(true));
+        assert_eq!(resp["lights"]["landing"]["on"], serde_json::json!(false));
+        assert_eq!(resp["lights"]["top_landing"]["on"], serde_json::json!(false));
+    }
+
+    // @lat: [[tests#HTTP API#Hot water endpoint returns the current DHW snapshot]]
+    #[tokio::test]
+    async fn hot_water_endpoint_returns_the_current_dhw_snapshot() {
+        let state = test_app_state();
+        {
+            let mut dhw = state.dhw_state.lock().await;
+            dhw.remaining = 91.5;
+            dhw.full_litres = 177.0;
+            dhw.effective_t1 = 47.25;
+            dhw.current_t1 = 48.0;
+            dhw.current_hwc = 43.5;
+            dhw.charge_state = DhwChargeState::Partial;
+            dhw.crossover_achieved = false;
+        }
+
+        let Json(resp) = api_hot_water(State(state)).await;
+
+        assert_eq!(resp["ok"], serde_json::json!(true));
+        assert_eq!(resp["remaining_litres"], serde_json::json!(91.5));
+        assert_eq!(resp["full_litres"], serde_json::json!(177.0));
+        assert_eq!(resp["effective_t1"], serde_json::json!(47.25));
+        assert_eq!(resp["charge_state"], serde_json::json!("partial"));
+        assert_eq!(resp["crossover_achieved"], serde_json::json!(false));
+        assert_eq!(resp["t1"], serde_json::json!(48.0));
+        assert_eq!(resp["hwc_storage"], serde_json::json!(43.5));
+    }
+
     // ── Motion automation tests ─────────────────────────────────────────
 
     // @lat: [[tests#Motion lighting automation#Dark motion turns on both motion lights and arms the timer]]
@@ -1984,6 +2271,34 @@ mod tests {
         let s = state.lock().await;
         assert!(s.lights_off_at.is_some());
         assert_eq!(s.illuminance.get("landing_motion"), Some(&15.0));
+    }
+
+    // @lat: [[tests#Motion lighting automation#Motion during an active timer refreshes the deadline]]
+    #[tokio::test]
+    async fn active_timer_motion_refreshes_the_deadline_without_duplicate_on_commands() {
+        let state = test_automation_state();
+        let previous_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        {
+            let mut s = state.lock().await;
+            s.lights_off_at = Some(previous_deadline);
+            s.illuminance.insert("landing_motion".to_string(), 10.0);
+        }
+        let (cmd_tx, mut cmd_rx) = broadcast::channel(8);
+        let z2m_state = Arc::new(Mutex::new(std::collections::HashMap::new()));
+
+        handle_z2m_message(
+            r#"{"topic":"landing_motion","payload":{"occupancy":true,"illuminance":10.0}}"#,
+            &state,
+            &cmd_tx,
+            &z2m_state,
+        )
+        .await;
+
+        assert!(cmd_rx.try_recv().is_err());
+
+        let s = state.lock().await;
+        let refreshed_deadline = s.lights_off_at.expect("timer should stay armed");
+        assert!(refreshed_deadline > previous_deadline);
     }
 
     // @lat: [[tests#Motion lighting automation#Bright motion only refreshes cached lux and does not switch lights]]
