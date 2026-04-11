@@ -1,26 +1,11 @@
 # Repository Overview & Map
 
-<!-- code-truth: d33cd13 -->
-
-## Purpose
-
-Single-binary Rust server replacing Home Assistant for a LAN-only Zigbee + heat pump setup. Three responsibilities:
-
-1. **Zigbee automations** — motion sensors → lights, with illuminance gating and manual override
-2. **Heat pump DHW control** — boost button + remaining hot water tracking
-3. **Mobile dashboard** — embedded HTML served on port 3030
-
-## Technologies
-
-- Rust (2021 edition), async via Tokio
-- axum (HTTP server), tokio-tungstenite (Z2M WebSocket client), reqwest/rustls (InfluxDB HTTP)
-- Cross-compiled to `aarch64-unknown-linux-gnu` for Raspberry Pi 5 (pi5data)
-- No MQTT dependency — talks Z2M WebSocket and ebusd TCP directly
+Code-derived navigation aid. For canonical architecture and domain rules, see [`lat.md/`](../../lat.md/lat.md).
 
 ## File Organisation
 
 ```
-src/main.rs           ← entire application (single-file service; currently 1847 lines)
+src/main.rs           ← entire application (single-file service)
 Cargo.toml            ← dependencies
 .cargo/config.toml    ← aarch64 cross-compile linker config
 vendor/zigbee2mqtt/   ← submodule pinned to 2.9.1 (reference only)
@@ -50,22 +35,19 @@ The file is organised in labelled sections:
 
 ### Where things are configured
 
-| Setting | Location | Current value |
-|---------|----------|---------------|
-| Z2M URL | `const Z2M_WS_URL` | `ws://emonpi:8080/api` |
-| HTTP port | `const HTTP_PORT` | `3030` |
-| All toggleable lights | `const LIGHTS` | `["landing", "hall", "top_landing"]` |
-| Motion-triggered lights | `const MOTION_LIGHTS` | `["landing", "hall"]` |
-| Motion sensors + thresholds | `const MOTION_SENSORS` | `[("landing_motion", 15.0), ("hall_motion", 15.0)]` |
-| Light off delay | `const OFF_DELAY` | `300s` (5 minutes) |
-| DHW config | `HubConfig` loaded from `/etc/z2m-hub.toml` | `full_litres=177`, decay, thresholds (see `z2m-hub.toml`) |
-| InfluxDB URL/token/org | `const INFLUXDB_*` | Hardcoded (LAN-only) |
-| ebusd host/port | `const EBUSD_HOST/PORT` | `localhost:8888` |
-| Heating MVP proxy | `const HEATING_MVP_URL` | `http://127.0.0.1:3031` |
+See [`lat.md/infrastructure.md`](../../lat.md/infrastructure.md) for config ownership and deployment shape. Quick reference for code constants:
 
-### Key distinction: LIGHTS vs MOTION_LIGHTS
+| Setting | Location |
+|---------|----------|
+| Z2M URL | `const Z2M_WS_URL` |
+| HTTP port | `const HTTP_PORT` |
+| All toggleable lights | `const LIGHTS` |
+| Motion-triggered lights | `const MOTION_LIGHTS` |
+| Motion sensors + thresholds | `const MOTION_SENSORS` |
+| Light off delay | `const OFF_DELAY` |
+| DHW config | `HubConfig` loaded from `/etc/z2m-hub.toml` |
+| InfluxDB URL/token/org | `const INFLUXDB_*` |
+| ebusd host/port | `const EBUSD_HOST/PORT` |
+| Heating MVP proxy | `const HEATING_MVP_URL` |
 
-`LIGHTS` = all lights with dashboard toggles (landing, hall, top_landing).
-`MOTION_LIGHTS` = subset triggered by motion sensors (landing, hall only).
-
-top_landing has a dashboard toggle but is not linked to any motion sensor. To add a new light to the dashboard only, add to `LIGHTS`. To also link it to motion, add to `MOTION_LIGHTS`.
+For the LIGHTS vs MOTION_LIGHTS distinction, see [`lat.md/automations.md`](../../lat.md/automations.md).

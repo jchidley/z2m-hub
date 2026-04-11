@@ -1062,8 +1062,12 @@ async fn is_charging() -> bool {
     status.ends_with(";hwc") || sfmode == "load"
 }
 
-async fn write_dhw_to_influxdb(client: &reqwest::Client, s: &DhwState) {
-    let line = format!(
+/// Build the InfluxDB line-protocol payload for the current DHW state.
+///
+/// Pure function so the field set and type encoding can be tested
+/// independently of the HTTP transport.
+fn format_dhw_line_protocol(s: &DhwState) -> String {
+    format!(
         "dhw remaining_litres={:.1},model_version=2i,t1={:.2},hwc_storage={:.2},\
          effective_t1={:.2},charge_state=\"{}\",crossover={},bottom_zone_hot={}",
         s.remaining,
@@ -1074,7 +1078,11 @@ async fn write_dhw_to_influxdb(client: &reqwest::Client, s: &DhwState) {
         s.crossover_achieved,
         // Bottom zone is "hot" when HwcStorage is significantly above mains (~20°C)
         s.current_hwc > 30.0,
-    );
+    )
+}
+
+async fn write_dhw_to_influxdb(client: &reqwest::Client, s: &DhwState) {
+    let line = format_dhw_line_protocol(s);
     let result = client
         .post(format!(
             "{INFLUXDB_URL}/api/v2/write?org={INFLUXDB_ORG}&bucket=energy&precision=s"
@@ -1218,6 +1226,24 @@ fn apply_draw_tracking(
     }
 }
 
+/// Decide the runtime full_litres given the config value and a recommended
+/// value from the database.  Returns `None` when the recommendation is
+/// outside sane bounds or non-positive (caller should keep the current value).
+fn apply_autoload(current: f64, recommended: f64, min: f64, max: f64) -> Option<f64> {
+    if recommended >= min && recommended <= max {
+        Some(current.max(recommended))
+    } else {
+        None
+    }
+}
+
+/// Reconstruct the Multical volume register reading that corresponded to
+/// the last charge-completion reset, given current sensor and persisted state.
+fn reconstruct_volume_at_reset(full_litres: f64, remaining: f64, volume_now: f64) -> f64 {
+    let already_drawn = (full_litres - remaining).max(0.0);
+    volume_now - already_drawn
+}
+
 async fn dhw_tracking_loop(
     state: Arc<Mutex<DhwState>>,
     client: reqwest::Client,
@@ -1232,10 +1258,10 @@ async fn dhw_tracking_loop(
   |> filter(fn: (r) => r._measurement == "dhw_capacity" and r._field == "recommended_full_litres")
   |> last()"#;
         if let Ok((recommended, _)) = query_influxdb(&client, query).await {
-            if recommended >= cfg.full_litres_min && recommended <= cfg.full_litres_max {
-                let mut s = state.lock().await;
+            let mut s = state.lock().await;
+            if let Some(new_full) = apply_autoload(s.full_litres, recommended, cfg.full_litres_min, cfg.full_litres_max) {
                 let prev = s.full_litres;
-                s.full_litres = s.full_litres.max(recommended);
+                s.full_litres = new_full;
                 info!(
                     "DHW autoload: recommended={recommended:.0}L, \
                      config={prev:.0}L → using {:.0}L",
@@ -1268,10 +1294,7 @@ async fn dhw_tracking_loop(
 
         let mut s = state.lock().await;
         s.remaining = remaining;
-        // Reconstruct volume_at_reset: if 66L drawn from full, the reset
-        // point was 66L before the current register reading
-        let already_drawn = (s.full_litres - remaining).max(0.0);
-        s.volume_at_reset = volume - already_drawn;
+        s.volume_at_reset = reconstruct_volume_at_reset(s.full_litres, remaining, volume);
         s.was_charging = charging;
         s.current_t1 = t1;
         s.current_hwc = hwc;
@@ -1566,7 +1589,7 @@ async fn handle_z2m_message(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{Duration, Instant};
+    use std::{sync::OnceLock, time::{Duration, Instant}};
 
     /// Build a DhwConfig with the production defaults (matching HubConfig::default)
     fn test_cfg() -> DhwConfig {
@@ -1624,6 +1647,162 @@ mod tests {
             dhw_state: Arc::new(Mutex::new(test_state())),
             config: Arc::new(HubConfig::default()),
         }
+    }
+
+    fn heating_test_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn dhw_http_test_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    async fn spawn_heating_test_server(
+        requests: Arc<std::sync::Mutex<Vec<(String, Option<serde_json::Value>)>>>,
+    ) -> tokio::task::JoinHandle<()> {
+        let app = axum::Router::new()
+            .route(
+                "/status",
+                axum::routing::get({
+                    let requests = requests.clone();
+                    move || {
+                        let requests = requests.clone();
+                        async move {
+                            requests
+                                .lock()
+                                .expect("recorded requests mutex")
+                                .push(("GET /status".to_string(), None));
+                            Json(serde_json::json!({"ok": true, "status": "idle"}))
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/mode/{mode}",
+                axum::routing::post({
+                    let requests = requests.clone();
+                    move |axum::extract::Path(mode): axum::extract::Path<String>| {
+                        let requests = requests.clone();
+                        async move {
+                            requests
+                                .lock()
+                                .expect("recorded requests mutex")
+                                .push((format!("POST /mode/{mode}"), None));
+                            Json(serde_json::json!({"ok": true, "mode": mode}))
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/kill",
+                axum::routing::post({
+                    let requests = requests.clone();
+                    move || {
+                        let requests = requests.clone();
+                        async move {
+                            requests
+                                .lock()
+                                .expect("recorded requests mutex")
+                                .push(("POST /kill".to_string(), None));
+                            Json(serde_json::json!({"ok": true, "killed": true}))
+                        }
+                    }
+                }),
+            );
+        let app = app.route(
+            "/mode/away",
+            axum::routing::post({
+                let requests = requests.clone();
+                move |Json(body): Json<serde_json::Value>| {
+                    let requests = requests.clone();
+                    async move {
+                        requests
+                            .lock()
+                            .expect("recorded requests mutex")
+                            .push(("POST /mode/away".to_string(), Some(body.clone())));
+                        Json(serde_json::json!({"ok": true, "until": body["until"].clone()}))
+                    }
+                }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 3031))
+            .await
+            .expect("bind heating test server");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("run heating test server");
+        })
+    }
+
+    async fn spawn_ebusd_test_server(
+        responses: Arc<std::collections::HashMap<String, String>>,
+        commands: Arc<std::sync::Mutex<Vec<String>>>,
+    ) -> tokio::task::JoinHandle<()> {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 8888))
+            .await
+            .expect("bind ebusd test server");
+        let expected_connections = responses.len();
+
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+            for _ in 0..expected_connections {
+                let (mut stream, _) = listener.accept().await.expect("accept ebusd client");
+                let mut cmd = String::new();
+                stream
+                    .read_to_string(&mut cmd)
+                    .await
+                    .expect("read ebusd command");
+                let cmd = cmd.trim().to_string();
+                commands
+                    .lock()
+                    .expect("recorded commands mutex")
+                    .push(cmd.clone());
+                let response = responses.get(&cmd).cloned().unwrap_or_default();
+                stream
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("write ebusd response");
+            }
+        })
+    }
+
+    async fn spawn_influx_test_server(
+        body: &'static str,
+        queries: Arc<std::sync::Mutex<Vec<String>>>,
+    ) -> tokio::task::JoinHandle<()> {
+        let app = axum::Router::new().route(
+            "/api/v2/query",
+            axum::routing::post({
+                let queries = queries.clone();
+                move |request_body: String| {
+                    let queries = queries.clone();
+                    async move {
+                        queries
+                            .lock()
+                            .expect("recorded queries mutex")
+                            .push(request_body);
+                        (
+                            [(axum::http::header::CONTENT_TYPE, "application/csv")],
+                            body,
+                        )
+                    }
+                }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 8086))
+            .await
+            .expect("bind influx test server");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("run influx test server");
+        })
     }
 
     // ── apply_no_crossover_charge tests ─────────────────────────────────
@@ -2078,6 +2257,211 @@ gap_dissolved = 2.0
         assert_eq!(timestamp, "2026-04-10T10:05:00Z");
     }
 
+    // @lat: [[tests#InfluxDB interface#Influx parser returns zero defaults for empty body]]
+    #[test]
+    fn influx_parser_returns_zero_defaults_for_empty_body() {
+        let (value, timestamp) = parse_influx_query_csv("");
+
+        assert_eq!(value, 0.0);
+        assert_eq!(timestamp, "");
+    }
+
+    // @lat: [[tests#InfluxDB interface#Influx parser returns zero defaults for headers only]]
+    #[test]
+    fn influx_parser_returns_zero_defaults_for_headers_only() {
+        let body = "#datatype,string,long,dateTime:RFC3339,double\n,result,table,_time,_value\n";
+
+        let (value, timestamp) = parse_influx_query_csv(body);
+
+        assert_eq!(value, 0.0);
+        assert_eq!(timestamp, "");
+    }
+
+    // @lat: [[tests#InfluxDB interface#Influx parser returns zero defaults when value column missing]]
+    #[test]
+    fn influx_parser_returns_zero_defaults_when_value_column_missing() {
+        let body = ",result,table,_time,something_else\n,,0,2026-04-10T10:00:00Z,42.0\n";
+
+        let (value, timestamp) = parse_influx_query_csv(body);
+
+        assert_eq!(value, 0.0);
+        assert_eq!(timestamp, "");
+    }
+
+    // ── DHW write format (pre-migration regression) ───────────────────
+
+    // @lat: [[tests#DHW write format#LP golden snapshot matches expected field layout]]
+    #[test]
+    fn lp_golden_snapshot_matches_expected_field_layout() {
+        let s = test_state(); // full_litres=177, remaining=100, t1=50, hwc=48, effective=50, Full, no crossover
+
+        let lp = format_dhw_line_protocol(&s);
+
+        assert_eq!(
+            lp,
+            "dhw remaining_litres=100.0,model_version=2i,t1=50.00,hwc_storage=48.00,\
+             effective_t1=50.00,charge_state=\"full\",crossover=false,bottom_zone_hot=true"
+        );
+    }
+
+    // @lat: [[tests#DHW write format#LP payload includes all eight fields with correct types]]
+    #[test]
+    fn lp_payload_includes_all_eight_fields_with_correct_types() {
+        let mut s = test_state();
+        s.remaining = 134.5;
+        s.current_t1 = 51.23;
+        s.current_hwc = 47.89;
+        s.effective_t1 = 49.67;
+        s.charge_state = DhwChargeState::Full;
+        s.crossover_achieved = true;
+
+        let lp = format_dhw_line_protocol(&s);
+
+        assert!(lp.starts_with("dhw "), "measurement must be 'dhw'");
+        assert!(lp.contains("remaining_litres=134.5"));
+        assert!(lp.contains("model_version=2i"), "model_version must be integer-typed");
+        assert!(lp.contains("t1=51.23"));
+        assert!(lp.contains("hwc_storage=47.89"));
+        assert!(lp.contains("effective_t1=49.67"));
+        assert!(lp.contains("charge_state=\"full\""));
+        assert!(lp.contains("crossover=true"));
+        assert!(lp.contains("bottom_zone_hot=true"), "47.89 > 30 → hot");
+    }
+
+    // @lat: [[tests#DHW write format#Bottom zone hot threshold at thirty degrees]]
+    #[test]
+    fn bottom_zone_hot_threshold_at_thirty_degrees() {
+        let mut s = test_state();
+
+        // Just above threshold
+        s.current_hwc = 30.1;
+        assert!(format_dhw_line_protocol(&s).contains("bottom_zone_hot=true"));
+
+        // At threshold — not hot (strict >30)
+        s.current_hwc = 30.0;
+        assert!(format_dhw_line_protocol(&s).contains("bottom_zone_hot=false"));
+
+        // Below threshold
+        s.current_hwc = 20.0;
+        assert!(format_dhw_line_protocol(&s).contains("bottom_zone_hot=false"));
+    }
+
+    // @lat: [[tests#DHW write format#LP encodes all charge states correctly]]
+    #[test]
+    fn lp_encodes_all_charge_states_correctly() {
+        let mut s = test_state();
+        for (state, expected) in [
+            (DhwChargeState::Full, "\"full\""),
+            (DhwChargeState::Partial, "\"partial\""),
+            (DhwChargeState::Standby, "\"standby\""),
+            (DhwChargeState::ChargingBelow, "\"charging_below\""),
+            (DhwChargeState::ChargingUniform, "\"charging_uniform\""),
+        ] {
+            s.charge_state = state;
+            let lp = format_dhw_line_protocol(&s);
+            assert!(
+                lp.contains(&format!("charge_state={expected}")),
+                "state {expected} not found in: {lp}"
+            );
+        }
+    }
+
+    // @lat: [[tests#DHW write format#Write failure does not stop the caller]]
+    #[tokio::test]
+    async fn write_failure_does_not_stop_the_caller() {
+        let _guard = dhw_http_test_lock().lock().await;
+
+        // Mock server that returns 500 for writes
+        let app = axum::Router::new().route(
+            "/api/v2/write",
+            axum::routing::post(|| async {
+                (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "db down")
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 8086))
+            .await
+            .expect("bind write test server");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("run write test server");
+        });
+
+        let client = reqwest::Client::new();
+        let s = test_state();
+
+        // This must return normally — not panic, not propagate an error
+        write_dhw_to_influxdb(&client, &s).await;
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    // @lat: [[tests#DHW write format#Write to unreachable server does not stop the caller]]
+    #[tokio::test]
+    async fn write_to_unreachable_server_does_not_stop_the_caller() {
+        // No server running — connection refused
+        let client = reqwest::Client::new();
+        let s = test_state();
+
+        // This must return normally despite the transport error
+        write_dhw_to_influxdb(&client, &s).await;
+    }
+
+    // ── Autoload bounds logic (pre-migration regression) ────────────
+
+    // @lat: [[tests#DHW autoload#Autoload applies max of config and recommended when in sane range]]
+    #[test]
+    fn autoload_applies_max_when_in_sane_range() {
+        // recommended > current → upgrade
+        assert_eq!(apply_autoload(150.0, 177.0, 100.0, 250.0), Some(177.0));
+        // recommended < current → keep current
+        assert_eq!(apply_autoload(177.0, 150.0, 100.0, 250.0), Some(177.0));
+        // recommended == current → no change
+        assert_eq!(apply_autoload(177.0, 177.0, 100.0, 250.0), Some(177.0));
+    }
+
+    // @lat: [[tests#DHW autoload#Autoload rejects values outside sane bounds]]
+    #[test]
+    fn autoload_rejects_outside_sane_bounds() {
+        // Too high
+        assert_eq!(apply_autoload(177.0, 300.0, 100.0, 250.0), None);
+        // Too low
+        assert_eq!(apply_autoload(177.0, 50.0, 100.0, 250.0), None);
+    }
+
+    // @lat: [[tests#DHW autoload#Autoload accepts values at exact boundaries]]
+    #[test]
+    fn autoload_accepts_at_exact_boundaries() {
+        // At min boundary
+        assert_eq!(apply_autoload(80.0, 100.0, 100.0, 250.0), Some(100.0));
+        // At max boundary
+        assert_eq!(apply_autoload(177.0, 250.0, 100.0, 250.0), Some(250.0));
+    }
+
+    // ── Volume-at-reset reconstruction (pre-migration regression) ───
+
+    // @lat: [[tests#DHW startup#Volume at reset reconstructs from drawn volume]]
+    #[test]
+    fn volume_at_reset_reconstructs_from_drawn_volume() {
+        // 66L drawn from 177L full → volume_at_reset should be 66L before current reading
+        assert_eq!(reconstruct_volume_at_reset(177.0, 111.0, 1000.0), 934.0);
+    }
+
+    // @lat: [[tests#DHW startup#Volume at reset at full capacity gives current volume]]
+    #[test]
+    fn volume_at_reset_at_full_capacity_gives_current_volume() {
+        // remaining == full → nothing drawn → reset == current register
+        assert_eq!(reconstruct_volume_at_reset(177.0, 177.0, 1000.0), 1000.0);
+    }
+
+    // @lat: [[tests#DHW startup#Volume at reset clamps negative drawn to zero]]
+    #[test]
+    fn volume_at_reset_clamps_negative_drawn_to_zero() {
+        // remaining > full (shouldn't happen but defensive) → already_drawn clamped to 0
+        assert_eq!(reconstruct_volume_at_reset(177.0, 200.0, 1000.0), 1000.0);
+    }
+
     // @lat: [[tests#Heating proxy#Heating proxy passes success JSON through unchanged]]
     #[test]
     fn heating_proxy_passes_success_json_through_unchanged() {
@@ -2105,6 +2489,76 @@ gap_dissolved = 2.0
         let relayed = heating_proxy_json(Err("bad json".to_string()), false);
 
         assert_eq!(relayed, serde_json::json!({"error": "bad json"}));
+    }
+
+    // @lat: [[tests#Heating proxy#Heating status calls upstream status with GET]]
+    #[tokio::test]
+    async fn heating_status_calls_upstream_status_with_get() {
+        let _guard = heating_test_lock().lock().await;
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let server = spawn_heating_test_server(requests.clone()).await;
+        let state = test_app_state();
+
+        let Json(resp) = api_heating_status(State(state)).await;
+
+        assert_eq!(resp, serde_json::json!({"ok": true, "status": "idle"}));
+        assert_eq!(
+            requests.lock().expect("recorded requests mutex").as_slice(),
+            &[("GET /status".to_string(), None)]
+        );
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    // @lat: [[tests#Heating proxy#Heating mode and kill call their upstream POST endpoints]]
+    #[tokio::test]
+    async fn heating_mode_and_kill_call_their_upstream_post_endpoints() {
+        let _guard = heating_test_lock().lock().await;
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let server = spawn_heating_test_server(requests.clone()).await;
+        let state = test_app_state();
+
+        let Json(mode_resp) = api_heating_mode(
+            State(state.clone()),
+            axum::extract::Path("comfort".to_string()),
+        )
+        .await;
+        let Json(kill_resp) = api_heating_kill(State(state)).await;
+
+        assert_eq!(mode_resp, serde_json::json!({"ok": true, "mode": "comfort"}));
+        assert_eq!(kill_resp, serde_json::json!({"ok": true, "killed": true}));
+        assert_eq!(
+            requests.lock().expect("recorded requests mutex").as_slice(),
+            &[
+                ("POST /mode/comfort".to_string(), None),
+                ("POST /kill".to_string(), None),
+            ]
+        );
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    // @lat: [[tests#Heating proxy#Heating away forwards request JSON body unchanged]]
+    #[tokio::test]
+    async fn heating_away_forwards_request_json_body_unchanged() {
+        let _guard = heating_test_lock().lock().await;
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let server = spawn_heating_test_server(requests.clone()).await;
+        let state = test_app_state();
+        let body = serde_json::json!({"until": "2026-04-11T18:30:00Z", "reason": "school run"});
+
+        let Json(resp) = api_heating_away(State(state), Json(body.clone())).await;
+
+        assert_eq!(resp, serde_json::json!({"ok": true, "until": "2026-04-11T18:30:00Z"}));
+        assert_eq!(
+            requests.lock().expect("recorded requests mutex").as_slice(),
+            &[("POST /mode/away".to_string(), Some(body))]
+        );
+
+        server.abort();
+        let _ = server.await;
     }
 
     // ── HTTP handler tests ───────────────────────────────────────────────
@@ -2171,6 +2625,35 @@ gap_dissolved = 2.0
         assert!(cmd_rx.try_recv().is_err());
     }
 
+    // @lat: [[tests#HTTP API#Light on and off publish the requested state for known lights]]
+    #[tokio::test]
+    async fn light_on_and_off_publish_requested_state_for_known_lights() {
+        let state = test_app_state();
+        let mut cmd_rx = state.cmd_tx.subscribe();
+
+        let Json(on_resp) = api_light_on(
+            State(state.clone()),
+            axum::extract::Path("hall".to_string()),
+        )
+        .await;
+        assert_eq!(on_resp, serde_json::json!({"ok": true, "light": "hall", "state": "ON"}));
+        let on_msg = cmd_rx.try_recv().expect("light on should publish a command");
+        assert_eq!(on_msg.topic, "hall/set");
+        assert_eq!(on_msg.payload, serde_json::json!({"state": "ON"}));
+
+        let Json(off_resp) = api_light_off(
+            State(state.clone()),
+            axum::extract::Path("top_landing".to_string()),
+        )
+        .await;
+        assert_eq!(off_resp, serde_json::json!({"ok": true, "light": "top_landing", "state": "OFF"}));
+        let off_msg = cmd_rx.try_recv().expect("light off should publish a command");
+        assert_eq!(off_msg.topic, "top_landing/set");
+        assert_eq!(off_msg.payload, serde_json::json!({"state": "OFF"}));
+
+        assert!(cmd_rx.try_recv().is_err());
+    }
+
     // @lat: [[tests#HTTP API#Lights state reports missing cache entries as off]]
     #[tokio::test]
     async fn lights_state_reports_missing_cache_entries_as_off() {
@@ -2215,7 +2698,179 @@ gap_dissolved = 2.0
         assert_eq!(resp["hwc_storage"], serde_json::json!(43.5));
     }
 
+    // @lat: [[tests#HTTP API#DHW boost returns ok true only for done]]
+    #[tokio::test]
+    async fn dhw_boost_returns_ok_true_only_for_done() {
+        let _guard = dhw_http_test_lock().lock().await;
+        let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let responses = Arc::new(std::collections::HashMap::from([(
+            "write -c 700 HwcSFMode load".to_string(),
+            "done".to_string(),
+        )]));
+        let ebusd = spawn_ebusd_test_server(responses, commands.clone()).await;
+        let state = test_app_state();
+
+        let Json(resp) = api_dhw_boost(State(state)).await;
+
+        assert_eq!(resp, serde_json::json!({"ok": true}));
+        assert_eq!(
+            commands.lock().expect("recorded commands mutex").as_slice(),
+            &["write -c 700 HwcSFMode load".to_string()]
+        );
+
+        let _ = ebusd.await;
+    }
+
+    // @lat: [[tests#HTTP API#DHW boost unexpected replies include ok false and the reply text]]
+    #[tokio::test]
+    async fn dhw_boost_unexpected_replies_include_ok_false_and_reply_text() {
+        let _guard = dhw_http_test_lock().lock().await;
+        let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let responses = Arc::new(std::collections::HashMap::from([(
+            "write -c 700 HwcSFMode load".to_string(),
+            "busy".to_string(),
+        )]));
+        let ebusd = spawn_ebusd_test_server(responses, commands.clone()).await;
+        let state = test_app_state();
+
+        let Json(resp) = api_dhw_boost(State(state)).await;
+
+        assert_eq!(resp, serde_json::json!({"ok": false, "error": "busy"}));
+        assert_eq!(
+            commands.lock().expect("recorded commands mutex").as_slice(),
+            &["write -c 700 HwcSFMode load".to_string()]
+        );
+
+        let _ = ebusd.await;
+    }
+
+    // @lat: [[tests#HTTP API#DHW status combines ebusd and Influx readings into one snapshot]]
+    #[tokio::test]
+    async fn dhw_status_combines_ebusd_and_influx_readings_into_one_snapshot() {
+        let _guard = dhw_http_test_lock().lock().await;
+        let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let queries = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let responses = Arc::new(std::collections::HashMap::from([
+            (
+                "read -f -c 700 HwcSFMode".to_string(),
+                "load".to_string(),
+            ),
+            (
+                "read -f -c hmu Status01".to_string(),
+                "55.0;38.5;10.0;60.0;48.2;off".to_string(),
+            ),
+            (
+                "read -f -c 700 HwcTempDesired".to_string(),
+                "52.0".to_string(),
+            ),
+            (
+                "read -f -c 700 HwcStorageTemp".to_string(),
+                "47.25".to_string(),
+            ),
+        ]));
+        let ebusd = spawn_ebusd_test_server(responses, commands.clone()).await;
+        let influx = spawn_influx_test_server(
+            ",result,table,_time,_value\n,,0,2026-04-11T11:15:00Z,49.75\n",
+            queries.clone(),
+        )
+        .await;
+        let state = test_app_state();
+
+        let Json(resp) = api_dhw_status(State(state)).await;
+
+        assert_eq!(resp["ok"], serde_json::json!(true));
+        assert_eq!(resp["charging"], serde_json::json!(true));
+        assert_eq!(resp["sfmode"], serde_json::json!("load"));
+        assert_eq!(resp["t1_hot"], serde_json::json!(49.75));
+        assert_eq!(resp["cylinder_temp"], serde_json::json!(47.25));
+        assert_eq!(resp["return_temp"], serde_json::json!(38.5));
+        assert_eq!(resp["target_temp"], serde_json::json!(52.0));
+        assert_eq!(
+            commands.lock().expect("recorded commands mutex").as_slice(),
+            &[
+                "read -f -c 700 HwcSFMode".to_string(),
+                "read -f -c hmu Status01".to_string(),
+                "read -f -c 700 HwcTempDesired".to_string(),
+                "read -f -c 700 HwcStorageTemp".to_string(),
+            ]
+        );
+        assert!(queries.lock().expect("recorded queries mutex")[0].contains("dhw_t1"));
+
+        let _ = ebusd.await;
+        influx.abort();
+        let _ = influx.await;
+    }
+
+    // @lat: [[tests#HTTP API#DHW status falls back to safe defaults when upstream reads fail]]
+    #[tokio::test]
+    async fn dhw_status_falls_back_to_safe_defaults_when_upstream_reads_fail() {
+        let _guard = dhw_http_test_lock().lock().await;
+        let state = test_app_state();
+
+        let Json(resp) = api_dhw_status(State(state)).await;
+
+        assert_eq!(resp, serde_json::json!({
+            "ok": true,
+            "charging": false,
+            "sfmode": "",
+            "t1_hot": 0.0,
+            "cylinder_temp": 0.0,
+            "return_temp": 0.0,
+            "target_temp": 0.0,
+        }));
+    }
+
     // ── Motion automation tests ─────────────────────────────────────────
+
+    // @lat: [[tests#HTTP API#Retained slashless Zigbee topics are cached for dashboard decisions]]
+    #[tokio::test]
+    async fn slashless_non_bridge_topics_are_cached_for_dashboard_decisions() {
+        let state = test_automation_state();
+        let (cmd_tx, _cmd_rx) = broadcast::channel(8);
+        let z2m_state = Arc::new(Mutex::new(std::collections::HashMap::new()));
+
+        handle_z2m_message(
+            r#"{"topic":"top_landing","payload":{"state":"ON","brightness":180}}"#,
+            &state,
+            &cmd_tx,
+            &z2m_state,
+        )
+        .await;
+
+        let zs = z2m_state.lock().await;
+        assert_eq!(
+            zs.get("top_landing"),
+            Some(&serde_json::json!({"state": "ON", "brightness": 180}))
+        );
+    }
+
+    // @lat: [[tests#HTTP API#Bridge and nested Zigbee topics are not cached as device state]]
+    #[tokio::test]
+    async fn bridge_and_nested_topics_are_not_cached_as_device_state() {
+        let state = test_automation_state();
+        let (cmd_tx, _cmd_rx) = broadcast::channel(8);
+        let z2m_state = Arc::new(Mutex::new(std::collections::HashMap::new()));
+
+        handle_z2m_message(
+            r#"{"topic":"bridge/state","payload":{"state":"online"}}"#,
+            &state,
+            &cmd_tx,
+            &z2m_state,
+        )
+        .await;
+        handle_z2m_message(
+            r#"{"topic":"hall/set","payload":{"state":"ON"}}"#,
+            &state,
+            &cmd_tx,
+            &z2m_state,
+        )
+        .await;
+
+        let zs = z2m_state.lock().await;
+        assert!(zs.get("bridge/state").is_none());
+        assert!(zs.get("hall/set").is_none());
+        assert!(zs.is_empty());
+    }
 
     // @lat: [[tests#Motion lighting automation#Dark motion turns on both motion lights and arms the timer]]
     #[tokio::test]
@@ -2401,6 +3056,48 @@ gap_dissolved = 2.0
         assert!(s.lights_off_at.is_some());
     }
 
+    // @lat: [[tests#Motion lighting automation#Timer expiry off does not create manual suppression]]
+    #[tokio::test(start_paused = true)]
+    async fn timer_expiry_off_does_not_create_manual_suppression() {
+        let state = test_automation_state();
+        {
+            let mut s = state.lock().await;
+            s.lights_off_at = Some(tokio::time::Instant::now() + Duration::from_secs(1));
+        }
+        let (cmd_tx, mut cmd_rx) = broadcast::channel(8);
+        let z2m_state = Arc::new(Mutex::new(std::collections::HashMap::new()));
+
+        let timer_task = tokio::spawn(timer_loop(state.clone(), cmd_tx.clone()));
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(2)).await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(cmd_rx.try_recv().expect("first OFF command").topic, "landing/set");
+        assert_eq!(cmd_rx.try_recv().expect("second OFF command").topic, "hall/set");
+        assert!(cmd_rx.try_recv().is_err());
+
+        {
+            let s = state.lock().await;
+            assert!(s.lights_off_at.is_none());
+            assert!(s.suppressed_until.is_none());
+        }
+
+        handle_z2m_message(
+            r#"{"topic":"hall","payload":{"state":"OFF"}}"#,
+            &state,
+            &cmd_tx,
+            &z2m_state,
+        )
+        .await;
+
+        let s = state.lock().await;
+        assert!(s.lights_off_at.is_none());
+        assert!(s.suppressed_until.is_none());
+
+        timer_task.abort();
+        let _ = timer_task.await;
+    }
+
     // ── Property tests ──────────────────────────────────────────────────
 
     mod prop {
@@ -2491,6 +3188,58 @@ gap_dissolved = 2.0
                     "small gap remaining {} < large gap remaining {} (gaps: {}, {})",
                     s1.remaining, s2.remaining,
                     t1_base - hwc_hi, t1_base - hwc_lo);
+            }
+
+            /// Autoload result is always >= current (capacity can only increase)
+            // @lat: [[tests#DHW autoload#Autoload never decreases current capacity]]
+            #[test]
+            fn autoload_never_decreases_current(
+                current in 50.0..300.0_f64,
+                recommended in 50.0..300.0_f64,
+                min in 50.0..150.0_f64,
+                max_offset in 50.0..200.0_f64,
+            ) {
+                let max = min + max_offset;
+                if let Some(result) = apply_autoload(current, recommended, min, max) {
+                    prop_assert!(result >= current,
+                        "autoload {} < current {}", result, current);
+                }
+            }
+
+            /// Volume-at-reset increases monotonically with volume_now
+            // @lat: [[tests#DHW startup#Volume at reset increases with register reading]]
+            #[test]
+            fn volume_at_reset_monotonic_in_volume(
+                full in 100.0..300.0_f64,
+                remaining in 0.0..300.0_f64,
+                vol_a in 0.0..10000.0_f64,
+                delta in 0.0..1000.0_f64,
+            ) {
+                let remaining = remaining.min(full);
+                let vol_b = vol_a + delta;
+                let reset_a = reconstruct_volume_at_reset(full, remaining, vol_a);
+                let reset_b = reconstruct_volume_at_reset(full, remaining, vol_b);
+                prop_assert!(reset_b >= reset_a,
+                    "reset_b {} < reset_a {} for volumes {}, {}",
+                    reset_b, reset_a, vol_a, vol_b);
+            }
+
+            /// Volume-at-reset increases monotonically with remaining (less drawn = higher reset)
+            // @lat: [[tests#DHW startup#Volume at reset increases with remaining litres]]
+            #[test]
+            fn volume_at_reset_monotonic_in_remaining(
+                full in 100.0..300.0_f64,
+                rem_a in 0.0..300.0_f64,
+                delta in 0.0..100.0_f64,
+                volume in 0.0..10000.0_f64,
+            ) {
+                let rem_a = rem_a.min(full);
+                let rem_b = (rem_a + delta).min(full);
+                let reset_a = reconstruct_volume_at_reset(full, rem_a, volume);
+                let reset_b = reconstruct_volume_at_reset(full, rem_b, volume);
+                prop_assert!(reset_b >= reset_a,
+                    "reset_b {} < reset_a {} for remaining {}, {}",
+                    reset_b, reset_a, rem_a, rem_b);
             }
 
             /// Standby decay: effective_t1 never increases with time

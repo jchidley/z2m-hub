@@ -13,6 +13,7 @@ This graph is the source of truth for current architecture, domain rules, and li
 - [[infrastructure]] records hosts, config ownership, and deployment shape.
 - [[constraints]] captures hard boundaries that should guide code changes.
 - [[tests]] records durable test specs and `@lat:` traceability anchors for high-value invariants.
+- [[postgres-migration]] tracks the repo-local PostgreSQL/TimescaleDB migration plan aligned with the shared energy-hub cutover.
 
 ## Reading order
 

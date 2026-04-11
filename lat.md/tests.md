@@ -150,6 +150,10 @@ While suppression is still active, dark occupancy events must not turn the motio
 
 Once the suppression deadline has passed, the next dark occupancy event must clear the stale suppression marker and behave like a normal trigger again.
 
+### Timer expiry off does not create manual suppression
+
+When the shared timer expires, the timer loop must clear `lights_off_at` before publishing OFF commands so the later Zigbee OFF confirmations are not mistaken for a user manual override and do not arm suppression.
+
 ## HTTP API
 
 These specs cover the lightweight handler logic that translates cached state into dashboard responses and optimistic Zigbee commands.
@@ -166,6 +170,10 @@ When no retained Zigbee state exists for a known light, the toggle handler must 
 
 Handlers for light control must reject names outside the configured light list and avoid sending any Zigbee command when they do.
 
+### Light on and off publish the requested state for known lights
+
+For a configured light name, the explicit on and off handlers must publish exactly one Zigbee command to `{light}/set` and return the same optimistic state in the HTTP response.
+
 ### Lights state reports missing cache entries as off
 
 The dashboard lights-state endpoint must include every configured light and mark ones without cached state as off rather than omitting them or treating them as on.
@@ -173,6 +181,30 @@ The dashboard lights-state endpoint must include every configured light and mark
 ### Hot water endpoint returns the current DHW snapshot
 
 The hot-water endpoint must mirror the in-memory DHW snapshot fields needed by the dashboard, including litres, temperatures, charge state, and crossover flag.
+
+### DHW status combines ebusd and Influx readings into one snapshot
+
+The live DHW-status endpoint must merge ebusd mode and status reads with the latest Influx `dhw_t1` reading, then expose a single dashboard JSON snapshot with charging, temperatures, and target temperature fields.
+
+### DHW status falls back to safe defaults when upstream reads fail
+
+If ebusd commands or the Influx `dhw_t1` query fail or return malformed values, the live DHW-status endpoint must still return `{ "ok": true }` with defaulted dashboard fields rather than failing the whole request.
+
+### DHW boost returns ok true only for done
+
+The one-shot DHW boost endpoint must return `{ "ok": true }` only when ebusd replies with `done` to `write -c 700 HwcSFMode load`.
+
+### DHW boost unexpected replies include ok false and the reply text
+
+If ebusd accepts the boost command but returns an unexpected reply string, the endpoint must return `{ "ok": false, "error": ... }` carrying that reply so the dashboard gets a stable failure shape.
+
+### Retained slashless Zigbee topics are cached for dashboard decisions
+
+When Zigbee2MQTT delivers a non-bridge topic without a slash, z2m-hub must cache that payload in `z2m_state` so later dashboard reads and toggle decisions can use it immediately.
+
+### Bridge and nested Zigbee topics are not cached as device state
+
+Bridge topics and slash-containing topics such as command acknowledgements must not be inserted into the retained device-state cache because they are not dashboard device snapshots.
 
 ## InfluxDB interface
 
@@ -185,6 +217,90 @@ When a Flux CSV response contains multiple data rows, the parser must keep the l
 ### Influx parser ignores comments and malformed values
 
 The parser must skip annotation lines and leave the previous numeric value intact when a later `_value` cell is not a valid float.
+
+### Influx parser returns zero defaults for empty body
+
+An empty response body must produce `(0.0, "")` so callers that default on error get consistent behaviour whether the HTTP call fails or returns nothing.
+
+### Influx parser returns zero defaults for headers only
+
+A CSV response with annotation and header rows but no data rows must produce `(0.0, "")` rather than panicking.
+
+### Influx parser returns zero defaults when value column missing
+
+When the CSV header row does not contain a `_value` column, the parser must return `(0.0, "")` rather than indexing out of bounds.
+
+## DHW write format
+
+These specs pin the InfluxDB line-protocol field set and type encoding so the PostgreSQL migration can verify INSERT equivalence.
+
+### LP golden snapshot matches expected field layout
+
+The exact LP string from `test_state()` defaults must match a pinned golden value so the migration can map each LP field to its INSERT column.
+
+### LP payload includes all eight fields with correct types
+
+The formatted line must contain all eight DHW fields with correct LP type encoding: floats, integer suffix, quoted string, and booleans.
+
+### Bottom zone hot threshold at thirty degrees
+
+`bottom_zone_hot` must be `true` when `current_hwc > 30.0` and `false` at or below 30.0, preserving the inline business rule during migration.
+
+### LP encodes all charge states correctly
+
+Every `DhwChargeState` variant (`full`, `partial`, `standby`, `charging_below`, `charging_uniform`) must appear as a quoted string in the line protocol.
+
+### Write failure does not stop the caller
+
+When the database returns a non-success HTTP status, the write function must log the error and return normally so the DHW tracking loop continues.
+
+### Write to unreachable server does not stop the caller
+
+When the database is unreachable (connection refused), the write function must log the transport error and return normally so the DHW tracking loop continues.
+
+## DHW autoload
+
+These specs cover the pure bounds logic that decides whether a database-recommended capacity value should upgrade the runtime full_litres.
+
+### Autoload applies max of config and recommended when in sane range
+
+When the recommended value is within `[full_litres_min, full_litres_max]`, the result must be `max(current, recommended)` so capacity can only increase.
+
+### Autoload rejects values outside sane bounds
+
+When the recommended value is above `full_litres_max` or below `full_litres_min`, the function must return `None` so the caller ignores it.
+
+### Autoload accepts values at exact boundaries
+
+Recommended values exactly equal to `full_litres_min` or `full_litres_max` must be accepted, not rejected.
+
+### Autoload never decreases current capacity
+
+For any in-range recommended value, the autoload result must be greater than or equal to the current value, ensuring capacity can only increase at startup.
+
+## DHW startup
+
+These specs cover the pure arithmetic that reconstructs Multical volume-register state on restart from persisted remaining litres.
+
+### Volume at reset reconstructs from drawn volume
+
+Given full_litres, remaining, and the current Multical register, `volume_at_reset` must equal `volume_now - (full_litres - remaining)` so the draw tracker resumes correctly.
+
+### Volume at reset at full capacity gives current volume
+
+When remaining equals full capacity (nothing drawn), `volume_at_reset` must equal the current register reading.
+
+### Volume at reset clamps negative drawn to zero
+
+When remaining exceeds full capacity (defensive edge case), the already-drawn amount must be clamped to zero so `volume_at_reset` never exceeds the current register.
+
+### Volume at reset increases with register reading
+
+For fixed full_litres and remaining, a higher Multical register reading must always produce a higher or equal volume_at_reset.
+
+### Volume at reset increases with remaining litres
+
+For fixed full_litres and volume_now, higher remaining litres (less drawn) must produce a higher or equal volume_at_reset.
 
 ## Heating proxy
 
@@ -201,6 +317,18 @@ For heating mode, away, and kill actions, local JSON or transport errors must be
 ### Heating status style errors omit ok false
 
 For the heating status read path, local JSON or transport errors must be wrapped as `{ "error": ... }` without adding an optimistic `ok` field.
+
+### Heating status calls upstream status with GET
+
+The heating status wrapper must call the upstream `/status` endpoint with HTTP GET and relay the returned JSON unchanged.
+
+### Heating mode and kill call their upstream POST endpoints
+
+The heating mode wrapper must POST to `/mode/{mode}`, and the kill wrapper must POST to `/kill`, so dashboard actions hit the intended upstream control routes.
+
+### Heating away forwards request JSON body unchanged
+
+The heating away wrapper must POST to `/mode/away` and forward the dashboard JSON body unchanged so the upstream service receives the requested away window payload intact.
 
 ## Config loading
 
