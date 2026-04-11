@@ -172,7 +172,6 @@ struct DhwState {
 
     // ── Flags ──
     was_charging: bool,
-    boost_initiated: bool,
     charge_state: DhwChargeState,
 }
 
@@ -247,7 +246,6 @@ async fn main() {
         current_t1: 0.0,
         current_hwc: 0.0,
         was_charging: false,
-        boost_initiated: false,
         charge_state: DhwChargeState::Standby,
     }));
 
@@ -460,10 +458,6 @@ async fn api_dhw_boost(State(state): State<AppState>) -> Json<serde_json::Value>
     match ebusd_command("write -c 700 HwcSFMode load").await {
         Ok(resp) if resp == "done" => {
             info!("HTTP: DHW boost (HwcSFMode=load) requested");
-            {
-                let mut dhw = state.dhw_state.lock().await;
-                dhw.boost_initiated = true;
-            }
             Json(serde_json::json!({"ok": true}))
         }
         Ok(resp) => {
@@ -1254,14 +1248,15 @@ async fn dhw_tracking_loop(
             }
 
             s.volume_at_reset = volume_now;
-            s.boost_initiated = false;
             s.hwc_crash_detected = false;
             write_dhw_to_influxdb(&client, &s).await;
         }
 
         // ── Draw detection and tracking ─────────────────────────────────
 
-        let is_drawing = !charging && dhw_flow > cfg.draw_flow_min;
+        // dhw_flow is from the Multical tap-side meter — independent of HP circuit.
+        // Draws during charging still deplete the cylinder and must be tracked.
+        let is_drawing = dhw_flow > cfg.draw_flow_min;
 
         if is_drawing && !s.drawing {
             // Draw just started
@@ -1272,7 +1267,7 @@ async fn dhw_tracking_loop(
             info!("DHW draw started: T1={t1_now:.1}, HwcS={hwc_now:.1}");
         }
 
-        if !charging && volume_now > s.volume_at_reset {
+        if volume_now > s.volume_at_reset {
             // Volume being drawn — subtract from remaining
             let drawn = volume_now - s.volume_at_reset;
             let remaining_by_volume = (full - drawn).max(0.0);
@@ -1521,5 +1516,332 @@ async fn handle_z2m_message(
             }
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// Build a DhwConfig with the production defaults (matching HubConfig::default)
+    fn test_cfg() -> DhwConfig {
+        DhwConfig {
+            full_litres: 177.0,
+            t1_decay_rate: 0.25,
+            reduced_t1: 42.0,
+            hwc_crash_threshold: 5.0,
+            vol_above_hwc: 148.0,
+            draw_flow_min: 100.0,
+            gap_sharp: 3.5,
+            gap_dissolved: 1.5,
+            full_litres_min: 160.0,
+            full_litres_max: 220.0,
+        }
+    }
+
+    /// Build a DhwState with sensible defaults for testing
+    fn test_state() -> DhwState {
+        DhwState {
+            full_litres: 177.0,
+            remaining: 100.0,
+            volume_at_reset: 0.0,
+            t1_at_charge_start: 40.0,
+            crossover_achieved: false,
+            t1_at_charge_end: 50.0,
+            hwc_at_charge_end: 48.0,
+            charge_end_time: None,
+            effective_t1: 50.0,
+            hwc_pre_draw: 48.0,
+            hwc_crash_detected: false,
+            t1_pre_draw: 50.0,
+            drawing: false,
+            current_t1: 50.0,
+            current_hwc: 48.0,
+            was_charging: false,
+            charge_state: DhwChargeState::Full,
+        }
+    }
+
+    // ── apply_no_crossover_charge tests ─────────────────────────────────
+
+    #[test]
+    fn no_crossover_dissolved_thermocline_sets_full() {
+        let cfg = test_cfg();
+        let mut s = test_state();
+        s.remaining = 80.0;
+
+        // gap = 45 - 44 = 1.0 < gap_dissolved(1.5) → full
+        apply_no_crossover_charge(&mut s, &cfg, 45.0, 44.0);
+
+        assert_eq!(s.remaining, 177.0);
+        assert_eq!(s.charge_state, DhwChargeState::Full);
+    }
+
+    #[test]
+    fn no_crossover_sharp_thermocline_preserves_remaining() {
+        let cfg = test_cfg();
+        let mut s = test_state();
+        s.remaining = 80.0;
+
+        // gap = 48 - 44 = 4.0 > gap_sharp(3.5) → remaining unchanged
+        apply_no_crossover_charge(&mut s, &cfg, 48.0, 44.0);
+
+        assert_eq!(s.remaining, 80.0);
+        assert_eq!(s.charge_state, DhwChargeState::Partial);
+    }
+
+    #[test]
+    fn no_crossover_intermediate_interpolates() {
+        let cfg = test_cfg();
+        let mut s = test_state();
+        s.remaining = 80.0;
+
+        // gap = 46 - 43.5 = 2.5, between dissolved(1.5) and sharp(3.5)
+        // frac = (3.5 - 2.5) / (3.5 - 1.5) = 1.0 / 2.0 = 0.5
+        // interpolated = 80 + 0.5 * (177 - 80) = 80 + 48.5 = 128.5
+        apply_no_crossover_charge(&mut s, &cfg, 46.0, 43.5);
+
+        assert!((s.remaining - 128.5).abs() < 0.01);
+        assert_eq!(s.charge_state, DhwChargeState::Partial);
+    }
+
+    #[test]
+    fn no_crossover_at_dissolved_boundary() {
+        let cfg = test_cfg();
+        let mut s = test_state();
+        s.remaining = 60.0;
+
+        // gap = exactly gap_dissolved (1.5) → should be full (gap < is strict, so 1.5 is NOT < 1.5)
+        // Actually gap < 1.5 is false when gap == 1.5, so it falls to intermediate
+        // frac = (3.5 - 1.5) / (3.5 - 1.5) = 1.0
+        // interpolated = 60 + 1.0 * (177 - 60) = 177
+        apply_no_crossover_charge(&mut s, &cfg, 45.0, 43.5);
+
+        assert!((s.remaining - 177.0).abs() < 0.01);
+        assert_eq!(s.charge_state, DhwChargeState::Partial);
+    }
+
+    #[test]
+    fn no_crossover_at_sharp_boundary() {
+        let cfg = test_cfg();
+        let mut s = test_state();
+        s.remaining = 60.0;
+
+        // gap = exactly gap_sharp (3.5) → not > 3.5, falls to intermediate
+        // frac = (3.5 - 3.5) / (3.5 - 1.5) = 0.0
+        // interpolated = 60 + 0.0 * (177 - 60) = 60
+        apply_no_crossover_charge(&mut s, &cfg, 47.0, 43.5);
+
+        assert!((s.remaining - 60.0).abs() < 0.01);
+        assert_eq!(s.charge_state, DhwChargeState::Partial);
+    }
+
+    #[test]
+    fn no_crossover_zero_remaining_dissolved_resets_to_full() {
+        let cfg = test_cfg();
+        let mut s = test_state();
+        s.remaining = 0.0;
+
+        // Dissolved thermocline should set to full even from 0
+        apply_no_crossover_charge(&mut s, &cfg, 44.0, 43.0);
+
+        assert_eq!(s.remaining, 177.0);
+        assert_eq!(s.charge_state, DhwChargeState::Full);
+    }
+
+    // ── apply_standby_decay tests ───────────────────────────────────────
+
+    #[test]
+    fn standby_decay_no_charge_end_time_is_noop() {
+        let cfg = test_cfg();
+        let mut s = test_state();
+        s.charge_end_time = None;
+        s.effective_t1 = 50.0;
+        s.charge_state = DhwChargeState::Full;
+
+        apply_standby_decay(&mut s, &cfg);
+
+        assert_eq!(s.effective_t1, 50.0);
+        assert_eq!(s.charge_state, DhwChargeState::Full);
+    }
+
+    #[test]
+    fn standby_decay_reduces_effective_t1() {
+        let cfg = test_cfg();
+        let mut s = test_state();
+        // Simulate charge ended 2 hours ago
+        s.charge_end_time = Some(Instant::now() - Duration::from_secs(7200));
+        s.t1_at_charge_end = 50.0;
+        s.charge_state = DhwChargeState::Full;
+
+        apply_standby_decay(&mut s, &cfg);
+
+        // effective_t1 = 50 - 0.25 * 2 = 49.5 (approximately)
+        assert!(s.effective_t1 < 50.0);
+        assert!(s.effective_t1 > 49.0);
+        // After 2h, should transition to Standby
+        assert_eq!(s.charge_state, DhwChargeState::Standby);
+    }
+
+    #[test]
+    fn standby_decay_below_reduced_t1_sets_standby() {
+        let cfg = test_cfg();
+        let mut s = test_state();
+        // Simulate charge ended long ago — T1 has decayed below reduced_t1 (42°C)
+        s.charge_end_time = Some(Instant::now() - Duration::from_secs(3600 * 40));
+        s.t1_at_charge_end = 50.0;
+        s.charge_state = DhwChargeState::Full;
+
+        apply_standby_decay(&mut s, &cfg);
+
+        // effective_t1 = 50 - 0.25 * 40 = 40.0, which is < reduced_t1(42)
+        assert!(s.effective_t1 < cfg.reduced_t1);
+        assert_eq!(s.charge_state, DhwChargeState::Standby);
+    }
+
+    #[test]
+    fn standby_decay_under_2h_preserves_full_state() {
+        let cfg = test_cfg();
+        let mut s = test_state();
+        // Charge ended 1 hour ago, T1 still above reduced_t1
+        s.charge_end_time = Some(Instant::now() - Duration::from_secs(3600));
+        s.t1_at_charge_end = 50.0;
+        s.charge_state = DhwChargeState::Full;
+
+        apply_standby_decay(&mut s, &cfg);
+
+        // effective_t1 ≈ 49.75, still above reduced_t1(42) and under 2h
+        assert!(s.effective_t1 > cfg.reduced_t1);
+        assert_eq!(s.charge_state, DhwChargeState::Full);
+    }
+
+    #[test]
+    fn standby_decay_does_not_override_charging_state() {
+        let cfg = test_cfg();
+        let mut s = test_state();
+        s.charge_end_time = Some(Instant::now() - Duration::from_secs(3600 * 3));
+        s.t1_at_charge_end = 50.0;
+        s.charge_state = DhwChargeState::ChargingBelow;
+
+        apply_standby_decay(&mut s, &cfg);
+
+        // >2h but charging state should be preserved by the second condition
+        // Wait — the code checks: if hours > 2.0 && !matches!(charging states)
+        // ChargingBelow IS matched, so the 2h rule doesn't apply
+        // But the reduced_t1 check at 49.25 > 42 doesn't trigger either
+        // So charging state should be preserved
+        assert_eq!(s.charge_state, DhwChargeState::ChargingBelow);
+    }
+
+    // ── Property tests ──────────────────────────────────────────────────
+
+    mod prop {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// Config strategy with sane ranges
+        fn arb_cfg() -> impl Strategy<Value = DhwConfig> {
+            (
+                100.0..300.0_f64,  // full_litres
+                0.1..1.0_f64,      // t1_decay_rate
+                35.0..45.0_f64,    // reduced_t1
+                2.0..10.0_f64,     // hwc_crash_threshold
+                50.0..200.0_f64,   // vol_above_hwc
+                50.0..200.0_f64,   // draw_flow_min
+            )
+                .prop_flat_map(
+                    |(full, decay, reduced, crash, vol, flow)| {
+                        // gap_dissolved must be < gap_sharp
+                        (0.5..5.0_f64).prop_flat_map(move |gap_d| {
+                            ((gap_d + 0.1)..10.0_f64).prop_map(move |gap_s| DhwConfig {
+                                full_litres: full,
+                                t1_decay_rate: decay,
+                                reduced_t1: reduced,
+                                hwc_crash_threshold: crash,
+                                vol_above_hwc: vol,
+                                draw_flow_min: flow,
+                                gap_sharp: gap_s,
+                                gap_dissolved: gap_d,
+                                full_litres_min: 160.0,
+                                full_litres_max: 220.0,
+                            })
+                        })
+                    },
+                )
+        }
+
+        proptest! {
+            /// Remaining is always bounded in [0, full_litres] after no-crossover charge
+            #[test]
+            fn no_crossover_remaining_bounded(
+                cfg in arb_cfg(),
+                prior_remaining in 0.0..300.0_f64,
+                t1 in 30.0..60.0_f64,
+                hwc in 20.0..60.0_f64,
+            ) {
+                let mut s = test_state();
+                s.full_litres = cfg.full_litres;
+                s.remaining = prior_remaining.min(cfg.full_litres);
+
+                apply_no_crossover_charge(&mut s, &cfg, t1, hwc);
+
+                prop_assert!(s.remaining >= 0.0,
+                    "remaining {} < 0", s.remaining);
+                prop_assert!(s.remaining <= cfg.full_litres,
+                    "remaining {} > full {}", s.remaining, cfg.full_litres);
+            }
+
+            /// Monotonicity: increasing gap should never increase remaining
+            /// (for same prior state and config)
+            #[test]
+            fn no_crossover_monotonic_in_gap(
+                cfg in arb_cfg(),
+                prior_remaining in 0.0..300.0_f64,
+                t1_base in 35.0..55.0_f64,
+                hwc_hi in 30.0..50.0_f64,
+            ) {
+                // Two gaps: small gap (hwc close to t1) and large gap (hwc further from t1)
+                let hwc_lo = hwc_hi - 2.0; // larger gap
+                if hwc_lo < 0.0 || hwc_hi >= t1_base {
+                    return Ok(());  // skip degenerate cases
+                }
+
+                let mut s1 = test_state();
+                s1.full_litres = cfg.full_litres;
+                s1.remaining = prior_remaining.min(cfg.full_litres);
+
+                let mut s2 = test_state();
+                s2.full_litres = cfg.full_litres;
+                s2.remaining = prior_remaining.min(cfg.full_litres);
+
+                apply_no_crossover_charge(&mut s1, &cfg, t1_base, hwc_hi); // small gap
+                apply_no_crossover_charge(&mut s2, &cfg, t1_base, hwc_lo); // large gap
+
+                prop_assert!(s1.remaining >= s2.remaining,
+                    "small gap remaining {} < large gap remaining {} (gaps: {}, {})",
+                    s1.remaining, s2.remaining,
+                    t1_base - hwc_hi, t1_base - hwc_lo);
+            }
+
+            /// Standby decay: effective_t1 never increases with time
+            #[test]
+            fn standby_decay_t1_never_increases(
+                cfg in arb_cfg(),
+                t1_end in 40.0..55.0_f64,
+                secs_elapsed in 0u64..200_000,
+            ) {
+                let mut s = test_state();
+                s.t1_at_charge_end = t1_end;
+                s.effective_t1 = t1_end;
+                s.charge_end_time = Some(Instant::now() - Duration::from_secs(secs_elapsed));
+                s.charge_state = DhwChargeState::Full;
+
+                apply_standby_decay(&mut s, &cfg);
+
+                prop_assert!(s.effective_t1 <= t1_end,
+                    "effective_t1 {} > t1_at_charge_end {}", s.effective_t1, t1_end);
+            }
+        }
     }
 }
