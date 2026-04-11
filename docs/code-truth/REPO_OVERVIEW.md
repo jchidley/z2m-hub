@@ -1,6 +1,6 @@
 # Repository Overview & Map
 
-<!-- code-truth: 3c35351 -->
+<!-- code-truth: d33cd13 -->
 
 ## Purpose
 
@@ -20,7 +20,7 @@ Single-binary Rust server replacing Home Assistant for a LAN-only Zigbee + heat 
 ## File Organisation
 
 ```
-src/main.rs           ← entire application (870 lines, single file)
+src/main.rs           ← entire application (~1520 lines, single file)
 Cargo.toml            ← dependencies
 .cargo/config.toml    ← aarch64 cross-compile linker config
 vendor/zigbee2mqtt/   ← submodule pinned to 2.9.1 (reference only)
@@ -38,7 +38,7 @@ The file is organised in labelled sections:
 | `main()` | Wires everything up: state init, axum router, `tokio::select!` for concurrent loops | Add a new background loop or HTTP route |
 | HTTP handlers (`api_*`) | `api_hot_water`, `api_dhw_boost`, `api_dhw_status`, `api_light_*`, `api_lights_state` | Add/modify API endpoints |
 | `query_influxdb()` | Flux query → CSV parse → (f64, String) | Change what's read from InfluxDB |
-| `write_remaining_to_influxdb()` | Line protocol write | Change what's written to InfluxDB |
+| `write_dhw_to_influxdb()` | Line protocol write | Change what's written to InfluxDB |
 | `ebusd_command()` | TCP connect → send command → read response | Change heat pump communication |
 | `HOME_PAGE` const | Entire HTML/CSS/JS dashboard as a string literal | Change the UI |
 | `dhw_tracking_loop()` | Polls ebusd every 10s, detects charge transitions, tracks volume | Change DHW logic |
@@ -56,10 +56,10 @@ The file is organised in labelled sections:
 | Motion-triggered lights | `const MOTION_LIGHTS` | `["landing", "hall"]` |
 | Motion sensors + thresholds | `const MOTION_SENSORS` | `[("landing_motion", 15.0), ("hall_motion", 15.0)]` |
 | Light off delay | `const OFF_DELAY` | `300s` (5 minutes) |
-| Tank capacity | `const DHW_FULL_LITRES` | `161.0` |
-| Boost refill | `const DHW_BOOST_PERCENT` | `0.5` (50%) |
+| DHW config | `HubConfig` loaded from `/etc/z2m-hub.toml` | `full_litres=177`, decay, thresholds (see `z2m-hub.toml`) |
 | InfluxDB URL/token/org | `const INFLUXDB_*` | Hardcoded (LAN-only) |
-| ebusd host/port | `const EBUSD_*` | `localhost:8888` |
+| ebusd host/port | `const EBUSD_HOST/PORT` | `localhost:8888` |
+| Heating MVP proxy | `const HEATING_MVP_URL` | `http://127.0.0.1:3031` |
 
 ### Key distinction: LIGHTS vs MOTION_LIGHTS
 

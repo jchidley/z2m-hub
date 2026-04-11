@@ -1,6 +1,6 @@
 # Decisions
 
-<!-- code-truth: 3c35351 -->
+<!-- code-truth: d33cd13 -->
 
 ## Structural (don't touch without good reason)
 
@@ -14,7 +14,7 @@ All connections are LAN-only (`ws://`, `http://`, raw TCP). Using `reqwest` with
 Shelling out to `docker exec` caused a GLIBC_2.39 dependency (`pidfd_spawnp`), which pi5data (Debian 12, glibc 2.36) doesn't have. Replaced with direct TCP to ebusd port 8888. This constraint applies to any future feature — don't spawn subprocesses.
 
 ### Single-file architecture
-Everything is in `src/main.rs`. For a ~870 line server with clear section labels, this is simpler than module splitting. Reconsider if the file exceeds ~1500 lines or if independent subsystems emerge.
+Everything is in `src/main.rs`. For a server with clear section labels, this is simpler than module splitting. The file is currently ~1520 lines — past the original ~1500 line threshold. Module splitting may be worth considering if further features are added.
 
 ### Embedded HTML dashboard
 The entire mobile UI is a `const` string literal (`HOME_PAGE`). No separate static files, no build step, no SPA framework. Keeps deployment as a single binary. Tradeoff: UI changes require recompilation.
@@ -33,14 +33,17 @@ When motion turns on lights, illuminance cache stops updating for that sensor. P
 ### 5-minute motion timeout
 `OFF_DELAY = 300s`. Long enough that you don't get plunged into darkness while on the stairs, short enough to not waste electricity. Re-trigger resets the full 5 minutes.
 
-### Manual off cancels automation
-If a MOTION_LIGHT is switched OFF (physical switch or dashboard) while the motion timer is active, the timer is cancelled. The automation won't fight the user. This is detected by watching Z2M state updates for MOTION_LIGHTS going to OFF while `lights_off_at` is set.
+### Manual off cancels and suppresses automation
+If a MOTION_LIGHT is switched OFF (physical switch or dashboard) while the motion timer is active, the timer is cancelled and re-triggering is suppressed for 5 minutes (`suppressed_until`). The automation won't fight the user. This is detected by watching Z2M state updates for MOTION_LIGHTS going to OFF while `lights_off_at` is set.
 
-### DHW boost = +50%
-Manual boost adds 50% of tank capacity (80.5L) capped at 161L. Approximation — a boost from empty won't fill completely, boost from nearly full gets capped. Tunable via `DHW_BOOST_PERCENT`.
+### DHW boost triggers a charge cycle
+Manual boost sets `HwcSFMode=load` via eBUS. When the resulting charge completes, remaining litres are determined by the crossover/thermocline model (same as any scheduled charge). The old +50% heuristic was replaced by the v0.2.0 physics-based model.
 
-### DHW tracking via volume register
-Usage tracked by Multical `dhw_volume_V1` — cumulative register in 10L steps. Coarse but reliable. The old InfluxDB Flux task attempted sub-register interpolation using flow integration, which was fragile (null crashes). z2m-hub just uses the register directly. Accuracy ±10L.
+### DHW tracking: physics-based model (v0.2.0)
+Usage tracked by multiple signals: Multical volume register (`dhw_volume_V1`), T1 temperature, HwcStorageTemp, and dhw_flow. Crossover detection (HwcStorage reaching T1_at_charge_start) determines full vs partial charge. Draw tracking uses volume subtraction with temperature-based overrides (HwcStorage crash caps, T1 drop caps). Standby decay models T1 cooling at 0.25°C/h. Config in `z2m-hub.toml`, capacity autoloaded from InfluxDB. Replaced the earlier simple volume-register-only approach.
+
+### Draw tracking runs during charging
+The Multical tap-side meter measures actual hot water draws independently of the heat pump circuit. Draws during a charge cycle still deplete the cylinder, so draw detection is always active — not gated on `!charging`. This replaced an earlier design that ignored draws while charging.
 
 ### Optimistic light toggle
 Toggle API returns intended new state immediately, before Z2M confirms. UI updates instantly, background poll (5s) catches real state. Failed toggle not noticed for up to 5 seconds.
@@ -50,7 +53,7 @@ All in-memory state resets on restart:
 - `z2m_state` recovers immediately (Z2M repushes on reconnect)
 - Light timers reset (lights just turn off naturally)
 - DHW remaining initialises from last InfluxDB value (minor gap possible)
-- `boost_initiated` resets to false (mid-boost restart → treated as scheduled charge = 161L instead of +50%)
+- Mid-boost restart → charge completion treated as scheduled (crossover/thermocline model applies normally)
 
 ## Open Questions
 

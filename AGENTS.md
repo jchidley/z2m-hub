@@ -109,7 +109,7 @@ All automations run in the Rust server (z2m-hub.service on pi5data). Previous sh
 - **Dashboard-only lights** (`LIGHTS`): landing, hall, top_landing (top_landing not motion-linked)
 - **Illuminance thresholds**: landing_motion ≤ 15 lx, hall_motion ≤ 15 lx
 - **Behaviour**: motion ON → motion lights ON, 5 min auto-off timer, re-trigger resets timer
-- **Manual override**: switching a motion light OFF (physical switch or dashboard) while timer is active cancels the automation
+- **Manual override**: switching a motion light OFF (physical switch or dashboard) while timer is active cancels the timer AND suppresses re-triggering for 5 minutes (`suppressed_until`). During suppression, motion events are ignored.
 - **Light-aware**: illuminance only sampled when lights are off (avoids self-inflation from switched-on lights boosting sensor readings by ~5-6 lx)
 
 ### DHW Tracking (v0.2.0 physics-based model)
@@ -137,6 +137,10 @@ All automations run in the Rust server (z2m-hub.service on pi5data). Previous sh
 | `/api/lights/{name}/toggle` | POST | Toggle light, returns new state |
 | `/api/lights/{name}/on` | POST | Turn light on |
 | `/api/lights/{name}/off` | POST | Turn light off |
+| `/api/heating/status` | GET | Proxy to heating-mvp (127.0.0.1:3031) status |
+| `/api/heating/mode/{mode}` | POST | Set heating mode (occupied/short-absence/disabled) |
+| `/api/heating/away` | POST | Set away mode (with JSON body) |
+| `/api/heating/kill` | POST | Emergency heating kill |
 
 ### Mobile Dashboard
 - Optimised for iPhone SE (320px) portrait

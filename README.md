@@ -25,11 +25,13 @@ open http://10.0.1.230:3030
 
 ## Documentation
 
-- [`AGENTS.md`](AGENTS.md) — LLM context (device list, API reference, infrastructure details)
-- [`docs/code-truth/`](docs/code-truth/) — Code-derived documentation:
+- [`AGENTS.md`](AGENTS.md) — LLM context: current operational truth (device list, API reference, infrastructure, automations). Update this first when operational facts change.
+- [`docs/code-truth/`](docs/code-truth/) — Code-derived stable documentation:
   - [Overview & Map](docs/code-truth/REPO_OVERVIEW.md) — what's where, how to navigate
   - [Architecture](docs/code-truth/ARCHITECTURE.md) — data flows, implicit contracts
   - [Decisions](docs/code-truth/DECISIONS.md) — why things are the way they are
+
+`AGENTS.md` is the canonical source for current operational truth. `docs/code-truth/` holds durable architecture and rationale — update these when the architecture actually changes, not for every operational tweak. When docs and code disagree, code wins.
 
 ## About This Code
 
