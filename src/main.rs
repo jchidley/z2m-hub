@@ -1113,6 +1113,75 @@ fn apply_no_crossover_charge(s: &mut DhwState, cfg: &DhwConfig, t1_now: f64, hwc
     }
 }
 
+fn apply_charge_completion(s: &mut DhwState, cfg: &DhwConfig, t1_now: f64, hwc_now: f64) {
+    let full = s.full_litres;
+    s.t1_at_charge_end = t1_now;
+    s.hwc_at_charge_end = hwc_now;
+    s.charge_end_time = Some(std::time::Instant::now());
+    s.effective_t1 = t1_now;
+
+    if s.crossover_achieved {
+        s.remaining = full;
+        s.charge_state = DhwChargeState::Full;
+        info!(
+            "DHW charge complete (crossover): T1={t1_now:.1}, HwcS={hwc_now:.1} \
+             → {full:.0}L"
+        );
+    } else {
+        apply_no_crossover_charge(s, cfg, t1_now, hwc_now);
+    }
+}
+
+fn apply_draw_tracking(
+    s: &mut DhwState,
+    cfg: &DhwConfig,
+    volume_now: f64,
+    t1_now: f64,
+    hwc_now: f64,
+) {
+    if volume_now <= s.volume_at_reset {
+        return;
+    }
+
+    let drawn = volume_now - s.volume_at_reset;
+    let remaining_by_volume = (s.full_litres - drawn).max(0.0);
+    s.remaining = s.remaining.min(remaining_by_volume);
+
+    if s.drawing {
+        let hwc_drop = s.hwc_pre_draw - hwc_now;
+        if hwc_drop > cfg.hwc_crash_threshold && !s.hwc_crash_detected {
+            s.hwc_crash_detected = true;
+            let cap = cfg.vol_above_hwc;
+            if s.remaining > cap {
+                info!(
+                    "DHW HwcS crash ({hwc_drop:.1}°C): capping remaining \
+                     {:.0} → {cap:.0}L",
+                    s.remaining
+                );
+                s.remaining = cap;
+            }
+        }
+
+        let t1_drop = s.t1_pre_draw - t1_now;
+        if t1_drop > 1.5 {
+            if s.remaining > 0.0 {
+                info!("DHW T1 crashed {t1_drop:.1}°C: remaining → 0");
+            }
+            s.remaining = 0.0;
+        } else if t1_drop > 0.5 {
+            let cap = 20.0;
+            if s.remaining > cap {
+                info!(
+                    "DHW T1 dropping {t1_drop:.1}°C: capping remaining \
+                     {:.0} → {cap:.0}L",
+                    s.remaining
+                );
+                s.remaining = cap;
+            }
+        }
+    }
+}
+
 async fn dhw_tracking_loop(
     state: Arc<Mutex<DhwState>>,
     client: reqwest::Client,
@@ -1196,7 +1265,6 @@ async fn dhw_tracking_loop(
         let dhw_flow = get_current_dhw_flow(&client).await;
 
         let mut s = state.lock().await;
-        let full = s.full_litres;
 
         // Update cached sensor values
         s.current_t1 = t1_now;
@@ -1229,24 +1297,7 @@ async fn dhw_tracking_loop(
 
         if s.was_charging && !charging {
             // ── Charge just ended ───────────────────────────────────────
-            s.t1_at_charge_end = t1_now;
-            s.hwc_at_charge_end = hwc_now;
-            s.charge_end_time = Some(std::time::Instant::now());
-            s.effective_t1 = t1_now;
-
-            if s.crossover_achieved {
-                // Full charge: crossover means entire cylinder at/above T1_start
-                s.remaining = full;
-                s.charge_state = DhwChargeState::Full;
-                info!(
-                    "DHW charge complete (crossover): T1={t1_now:.1}, HwcS={hwc_now:.1} \
-                     → {full:.0}L"
-                );
-            } else {
-                // No crossover: use gap-based thermocline model
-                apply_no_crossover_charge(&mut s, cfg, t1_now, hwc_now);
-            }
-
+            apply_charge_completion(&mut s, cfg, t1_now, hwc_now);
             s.volume_at_reset = volume_now;
             s.hwc_crash_detected = false;
             write_dhw_to_influxdb(&client, &s).await;
@@ -1268,50 +1319,7 @@ async fn dhw_tracking_loop(
         }
 
         if volume_now > s.volume_at_reset {
-            // Volume being drawn — subtract from remaining
-            let drawn = volume_now - s.volume_at_reset;
-            let remaining_by_volume = (full - drawn).max(0.0);
-            // Take the worse of volume-based and current remaining
-            s.remaining = s.remaining.min(remaining_by_volume);
-
-            // ── Temperature-based overrides during draw ─────────────────
-            if s.drawing {
-                // HwcStorage crash: thermocline reached 600mm sensor
-                let hwc_drop = s.hwc_pre_draw - hwc_now;
-                if hwc_drop > cfg.hwc_crash_threshold && !s.hwc_crash_detected {
-                    s.hwc_crash_detected = true;
-                    // Cap remaining at volume above HwcStorage
-                    let cap = cfg.vol_above_hwc;
-                    if s.remaining > cap {
-                        info!(
-                            "DHW HwcS crash ({hwc_drop:.1}°C): capping remaining \
-                             {:.0} → {cap:.0}L",
-                            s.remaining
-                        );
-                        s.remaining = cap;
-                    }
-                }
-
-                // T1 dropping = thermocline at draw-off height
-                let t1_drop = s.t1_pre_draw - t1_now;
-                if t1_drop > 1.5 {
-                    if s.remaining > 0.0 {
-                        info!("DHW T1 crashed {t1_drop:.1}°C: remaining → 0");
-                    }
-                    s.remaining = 0.0;
-                } else if t1_drop > 0.5 {
-                    let cap = 20.0;
-                    if s.remaining > cap {
-                        info!(
-                            "DHW T1 dropping {t1_drop:.1}°C: capping remaining \
-                             {:.0} → {cap:.0}L",
-                            s.remaining
-                        );
-                        s.remaining = cap;
-                    }
-                }
-            }
-
+            apply_draw_tracking(&mut s, cfg, volume_now, t1_now, hwc_now);
             write_dhw_to_influxdb(&client, &s).await;
         }
 
@@ -1563,8 +1571,17 @@ mod tests {
         }
     }
 
+    fn test_automation_state() -> Arc<Mutex<AutomationState>> {
+        Arc::new(Mutex::new(AutomationState {
+            lights_off_at: None,
+            suppressed_until: None,
+            illuminance: std::collections::HashMap::new(),
+        }))
+    }
+
     // ── apply_no_crossover_charge tests ─────────────────────────────────
 
+    // @lat: [[tests#DHW no crossover#Dissolved thermocline resets to full]]
     #[test]
     fn no_crossover_dissolved_thermocline_sets_full() {
         let cfg = test_cfg();
@@ -1578,6 +1595,7 @@ mod tests {
         assert_eq!(s.charge_state, DhwChargeState::Full);
     }
 
+    // @lat: [[tests#DHW no crossover#Sharp thermocline preserves prior remaining]]
     #[test]
     fn no_crossover_sharp_thermocline_preserves_remaining() {
         let cfg = test_cfg();
@@ -1591,6 +1609,7 @@ mod tests {
         assert_eq!(s.charge_state, DhwChargeState::Partial);
     }
 
+    // @lat: [[tests#DHW no crossover#Intermediate gap interpolates between prior and full]]
     #[test]
     fn no_crossover_intermediate_interpolates() {
         let cfg = test_cfg();
@@ -1606,6 +1625,7 @@ mod tests {
         assert_eq!(s.charge_state, DhwChargeState::Partial);
     }
 
+    // @lat: [[tests#DHW no crossover#Dissolved boundary stays on interpolation path]]
     #[test]
     fn no_crossover_at_dissolved_boundary() {
         let cfg = test_cfg();
@@ -1622,6 +1642,7 @@ mod tests {
         assert_eq!(s.charge_state, DhwChargeState::Partial);
     }
 
+    // @lat: [[tests#DHW no crossover#Sharp boundary keeps prior litres without full reset]]
     #[test]
     fn no_crossover_at_sharp_boundary() {
         let cfg = test_cfg();
@@ -1637,6 +1658,7 @@ mod tests {
         assert_eq!(s.charge_state, DhwChargeState::Partial);
     }
 
+    // @lat: [[tests#DHW no crossover#Dissolved gap can recover from zero remaining]]
     #[test]
     fn no_crossover_zero_remaining_dissolved_resets_to_full() {
         let cfg = test_cfg();
@@ -1650,8 +1672,176 @@ mod tests {
         assert_eq!(s.charge_state, DhwChargeState::Full);
     }
 
+    // ── apply_charge_completion tests ───────────────────────────────────
+
+    // @lat: [[tests#DHW charge completion#Crossover completion restores full litres and full state]]
+    #[test]
+    fn charge_completion_with_crossover_restores_full_litres_and_full_state() {
+        let cfg = test_cfg();
+        let mut s = test_state();
+        s.remaining = 45.0;
+        s.full_litres = 177.0;
+        s.crossover_achieved = true;
+        s.charge_state = DhwChargeState::ChargingUniform;
+
+        apply_charge_completion(&mut s, &cfg, 49.0, 46.0);
+
+        assert_eq!(s.remaining, 177.0);
+        assert_eq!(s.charge_state, DhwChargeState::Full);
+        assert_eq!(s.t1_at_charge_end, 49.0);
+        assert_eq!(s.hwc_at_charge_end, 46.0);
+        assert_eq!(s.effective_t1, 49.0);
+        assert!(s.charge_end_time.is_some());
+    }
+
+    // @lat: [[tests#DHW charge completion#Charge completion without crossover falls back to the gap model]]
+    #[test]
+    fn charge_completion_without_crossover_uses_gap_model() {
+        let cfg = test_cfg();
+        let mut s = test_state();
+        s.remaining = 80.0;
+        s.crossover_achieved = false;
+        s.charge_state = DhwChargeState::ChargingBelow;
+
+        apply_charge_completion(&mut s, &cfg, 46.0, 43.5);
+
+        assert!((s.remaining - 128.5).abs() < 0.01);
+        assert_eq!(s.charge_state, DhwChargeState::Partial);
+        assert_eq!(s.t1_at_charge_end, 46.0);
+        assert_eq!(s.hwc_at_charge_end, 43.5);
+        assert_eq!(s.effective_t1, 46.0);
+        assert!(s.charge_end_time.is_some());
+    }
+
+    // ── apply_draw_tracking tests ───────────────────────────────────────
+
+    // @lat: [[tests#DHW draw tracking#Volume draw alone reduces remaining litres]]
+    #[test]
+    fn draw_tracking_volume_only_reduces_remaining() {
+        let cfg = test_cfg();
+        let mut s = test_state();
+        s.full_litres = 177.0;
+        s.remaining = 120.0;
+        s.volume_at_reset = 1000.0;
+        s.drawing = false;
+
+        apply_draw_tracking(&mut s, &cfg, 1025.0, 50.0, 48.0);
+
+        assert_eq!(s.remaining, 120.0_f64.min(177.0 - 25.0));
+        assert!(!s.hwc_crash_detected);
+    }
+
+    // @lat: [[tests#DHW draw tracking#Hwc storage crash caps remaining at the upper sensor volume]]
+    #[test]
+    fn draw_tracking_hwc_crash_caps_remaining_at_upper_sensor_volume() {
+        let cfg = test_cfg();
+        let mut s = test_state();
+        s.full_litres = 177.0;
+        s.remaining = 170.0;
+        s.volume_at_reset = 1000.0;
+        s.drawing = true;
+        s.hwc_pre_draw = 50.0;
+        s.hwc_crash_detected = false;
+        s.t1_pre_draw = 50.0;
+
+        apply_draw_tracking(&mut s, &cfg, 1010.0, 49.8, 44.0);
+
+        assert_eq!(s.remaining, cfg.vol_above_hwc);
+        assert!(s.hwc_crash_detected);
+    }
+
+    // @lat: [[tests#DHW draw tracking#A repeated Hwc storage crash does not reapply the cap logic]]
+    #[test]
+    fn draw_tracking_repeated_hwc_crash_does_not_reapply_cap_logic() {
+        let cfg = test_cfg();
+        let mut s = test_state();
+        s.full_litres = 177.0;
+        s.remaining = 160.0;
+        s.volume_at_reset = 1000.0;
+        s.drawing = true;
+        s.hwc_pre_draw = 50.0;
+        s.hwc_crash_detected = true;
+        s.t1_pre_draw = 50.0;
+
+        apply_draw_tracking(&mut s, &cfg, 1010.0, 49.8, 44.0);
+
+        assert_eq!(s.remaining, 160.0_f64.min(177.0 - 10.0));
+        assert!(s.hwc_crash_detected);
+    }
+
+    // @lat: [[tests#DHW draw tracking#A moderate T1 drop caps remaining at twenty litres]]
+    #[test]
+    fn draw_tracking_moderate_t1_drop_caps_remaining_at_twenty_litres() {
+        let cfg = test_cfg();
+        let mut s = test_state();
+        s.full_litres = 177.0;
+        s.remaining = 150.0;
+        s.volume_at_reset = 1000.0;
+        s.drawing = true;
+        s.hwc_pre_draw = 48.0;
+        s.t1_pre_draw = 50.0;
+
+        apply_draw_tracking(&mut s, &cfg, 1010.0, 49.0, 47.5);
+
+        assert_eq!(s.remaining, 20.0);
+    }
+
+    // @lat: [[tests#DHW draw tracking#A severe T1 drop forces remaining to zero]]
+    #[test]
+    fn draw_tracking_severe_t1_drop_forces_remaining_to_zero() {
+        let cfg = test_cfg();
+        let mut s = test_state();
+        s.full_litres = 177.0;
+        s.remaining = 150.0;
+        s.volume_at_reset = 1000.0;
+        s.drawing = true;
+        s.hwc_pre_draw = 48.0;
+        s.t1_pre_draw = 50.0;
+
+        apply_draw_tracking(&mut s, &cfg, 1010.0, 48.4, 47.5);
+
+        assert_eq!(s.remaining, 0.0);
+    }
+
+    // @lat: [[tests#DHW draw tracking#A T1 drop exactly at one point five degrees stays on the twenty litre cap]]
+    #[test]
+    fn draw_tracking_t1_drop_at_one_point_five_degrees_stays_on_twenty_litre_cap() {
+        let cfg = test_cfg();
+        let mut s = test_state();
+        s.full_litres = 177.0;
+        s.remaining = 150.0;
+        s.volume_at_reset = 1000.0;
+        s.drawing = true;
+        s.hwc_pre_draw = 48.0;
+        s.t1_pre_draw = 50.0;
+
+        apply_draw_tracking(&mut s, &cfg, 1010.0, 48.5, 47.5);
+
+        assert_eq!(s.remaining, 20.0);
+    }
+
+    // @lat: [[tests#DHW draw tracking#A severe T1 drop overrides a Hwc crash cap]]
+    #[test]
+    fn draw_tracking_severe_t1_drop_overrides_hwc_crash_cap() {
+        let cfg = test_cfg();
+        let mut s = test_state();
+        s.full_litres = 177.0;
+        s.remaining = 170.0;
+        s.volume_at_reset = 1000.0;
+        s.drawing = true;
+        s.hwc_pre_draw = 50.0;
+        s.hwc_crash_detected = false;
+        s.t1_pre_draw = 50.0;
+
+        apply_draw_tracking(&mut s, &cfg, 1010.0, 48.0, 44.0);
+
+        assert_eq!(s.remaining, 0.0);
+        assert!(s.hwc_crash_detected);
+    }
+
     // ── apply_standby_decay tests ───────────────────────────────────────
 
+    // @lat: [[tests#DHW standby decay#No charge end time leaves state unchanged]]
     #[test]
     fn standby_decay_no_charge_end_time_is_noop() {
         let cfg = test_cfg();
@@ -1666,6 +1856,7 @@ mod tests {
         assert_eq!(s.charge_state, DhwChargeState::Full);
     }
 
+    // @lat: [[tests#DHW standby decay#Two hour decay cools top temperature and marks standby]]
     #[test]
     fn standby_decay_reduces_effective_t1() {
         let cfg = test_cfg();
@@ -1684,6 +1875,7 @@ mod tests {
         assert_eq!(s.charge_state, DhwChargeState::Standby);
     }
 
+    // @lat: [[tests#DHW standby decay#Cooling below reduced temperature marks standby]]
     #[test]
     fn standby_decay_below_reduced_t1_sets_standby() {
         let cfg = test_cfg();
@@ -1700,6 +1892,7 @@ mod tests {
         assert_eq!(s.charge_state, DhwChargeState::Standby);
     }
 
+    // @lat: [[tests#DHW standby decay#Short standby keeps full state]]
     #[test]
     fn standby_decay_under_2h_preserves_full_state() {
         let cfg = test_cfg();
@@ -1716,6 +1909,7 @@ mod tests {
         assert_eq!(s.charge_state, DhwChargeState::Full);
     }
 
+    // @lat: [[tests#DHW standby decay#Decay never overwrites active charging states]]
     #[test]
     fn standby_decay_does_not_override_charging_state() {
         let cfg = test_cfg();
@@ -1732,6 +1926,164 @@ mod tests {
         // But the reduced_t1 check at 49.25 > 42 doesn't trigger either
         // So charging state should be preserved
         assert_eq!(s.charge_state, DhwChargeState::ChargingBelow);
+    }
+
+    // ── Motion automation tests ─────────────────────────────────────────
+
+    // @lat: [[tests#Motion lighting automation#Dark motion turns on both motion lights and arms the timer]]
+    #[tokio::test]
+    async fn dark_motion_turns_on_both_motion_lights_and_arms_timer() {
+        let state = test_automation_state();
+        let (cmd_tx, mut cmd_rx) = broadcast::channel(8);
+        let z2m_state = Arc::new(Mutex::new(std::collections::HashMap::new()));
+
+        handle_z2m_message(
+            r#"{"topic":"hall_motion","payload":{"occupancy":true,"illuminance":10.0}}"#,
+            &state,
+            &cmd_tx,
+            &z2m_state,
+        )
+        .await;
+
+        let first = cmd_rx.try_recv().expect("first ON command");
+        let second = cmd_rx.try_recv().expect("second ON command");
+        assert_eq!(first.topic, "landing/set");
+        assert_eq!(first.payload, serde_json::json!({"state": "ON"}));
+        assert_eq!(second.topic, "hall/set");
+        assert_eq!(second.payload, serde_json::json!({"state": "ON"}));
+        assert!(cmd_rx.try_recv().is_err());
+
+        let s = state.lock().await;
+        assert!(s.lights_off_at.is_some());
+        assert_eq!(s.illuminance.get("hall_motion"), Some(&10.0));
+        drop(s);
+
+        let zs = z2m_state.lock().await;
+        assert_eq!(zs.get("hall_motion"), Some(&serde_json::json!({"occupancy": true, "illuminance": 10.0})));
+    }
+
+    // @lat: [[tests#Motion lighting automation#Motion at the darkness threshold still triggers the lights]]
+    #[tokio::test]
+    async fn motion_at_darkness_threshold_still_triggers_lights() {
+        let state = test_automation_state();
+        let (cmd_tx, mut cmd_rx) = broadcast::channel(8);
+        let z2m_state = Arc::new(Mutex::new(std::collections::HashMap::new()));
+
+        handle_z2m_message(
+            r#"{"topic":"landing_motion","payload":{"occupancy":true,"illuminance":15.0}}"#,
+            &state,
+            &cmd_tx,
+            &z2m_state,
+        )
+        .await;
+
+        assert_eq!(cmd_rx.try_recv().expect("first ON command").topic, "landing/set");
+        assert_eq!(cmd_rx.try_recv().expect("second ON command").topic, "hall/set");
+        assert!(cmd_rx.try_recv().is_err());
+
+        let s = state.lock().await;
+        assert!(s.lights_off_at.is_some());
+        assert_eq!(s.illuminance.get("landing_motion"), Some(&15.0));
+    }
+
+    // @lat: [[tests#Motion lighting automation#Bright motion only refreshes cached lux and does not switch lights]]
+    #[tokio::test]
+    async fn bright_motion_only_refreshes_cached_lux_and_does_not_switch_lights() {
+        let state = test_automation_state();
+        let (cmd_tx, mut cmd_rx) = broadcast::channel(8);
+        let z2m_state = Arc::new(Mutex::new(std::collections::HashMap::new()));
+
+        handle_z2m_message(
+            r#"{"topic":"landing_motion","payload":{"occupancy":true,"illuminance":30.0}}"#,
+            &state,
+            &cmd_tx,
+            &z2m_state,
+        )
+        .await;
+
+        assert!(cmd_rx.try_recv().is_err());
+
+        let s = state.lock().await;
+        assert!(s.lights_off_at.is_none());
+        assert_eq!(s.illuminance.get("landing_motion"), Some(&30.0));
+    }
+
+    // @lat: [[tests#Motion lighting automation#Manual off cancels the timer and suppresses retriggering]]
+    #[tokio::test]
+    async fn manual_off_cancels_timer_and_suppresses_retriggering() {
+        let state = test_automation_state();
+        {
+            let mut s = state.lock().await;
+            s.lights_off_at = Some(tokio::time::Instant::now() + OFF_DELAY);
+        }
+        let (cmd_tx, mut cmd_rx) = broadcast::channel(8);
+        let z2m_state = Arc::new(Mutex::new(std::collections::HashMap::new()));
+
+        handle_z2m_message(
+            r#"{"topic":"hall","payload":{"state":"OFF"}}"#,
+            &state,
+            &cmd_tx,
+            &z2m_state,
+        )
+        .await;
+
+        assert!(cmd_rx.try_recv().is_err());
+        let s = state.lock().await;
+        assert!(s.lights_off_at.is_none());
+        assert!(s.suppressed_until.is_some());
+    }
+
+    // @lat: [[tests#Motion lighting automation#Active suppression blocks dark motion retriggering]]
+    #[tokio::test]
+    async fn active_suppression_blocks_dark_motion_retriggering() {
+        let state = test_automation_state();
+        {
+            let mut s = state.lock().await;
+            s.suppressed_until = Some(tokio::time::Instant::now() + Duration::from_secs(60));
+        }
+        let (cmd_tx, mut cmd_rx) = broadcast::channel(8);
+        let z2m_state = Arc::new(Mutex::new(std::collections::HashMap::new()));
+
+        handle_z2m_message(
+            r#"{"topic":"landing_motion","payload":{"occupancy":true,"illuminance":10.0}}"#,
+            &state,
+            &cmd_tx,
+            &z2m_state,
+        )
+        .await;
+
+        assert!(cmd_rx.try_recv().is_err());
+
+        let s = state.lock().await;
+        assert!(s.suppressed_until.is_some());
+        assert!(s.lights_off_at.is_none());
+    }
+
+    // @lat: [[tests#Motion lighting automation#Expired suppression is cleared before a fresh dark motion trigger]]
+    #[tokio::test]
+    async fn expired_suppression_is_cleared_before_fresh_dark_motion_trigger() {
+        let state = test_automation_state();
+        {
+            let mut s = state.lock().await;
+            s.suppressed_until = Some(tokio::time::Instant::now() - Duration::from_secs(1));
+        }
+        let (cmd_tx, mut cmd_rx) = broadcast::channel(8);
+        let z2m_state = Arc::new(Mutex::new(std::collections::HashMap::new()));
+
+        handle_z2m_message(
+            r#"{"topic":"landing_motion","payload":{"occupancy":true,"illuminance":10.0}}"#,
+            &state,
+            &cmd_tx,
+            &z2m_state,
+        )
+        .await;
+
+        assert_eq!(cmd_rx.try_recv().expect("first ON command").topic, "landing/set");
+        assert_eq!(cmd_rx.try_recv().expect("second ON command").topic, "hall/set");
+
+        let s = state.lock().await;
+        assert!(s.suppressed_until.is_none());
+        assert!(s.lights_off_at.is_some());
     }
 
     // ── Property tests ──────────────────────────────────────────────────
@@ -1773,6 +2125,7 @@ mod tests {
 
         proptest! {
             /// Remaining is always bounded in [0, full_litres] after no-crossover charge
+            // @lat: [[tests#DHW no crossover#Remaining stays within zero and full capacity]]
             #[test]
             fn no_crossover_remaining_bounded(
                 cfg in arb_cfg(),
@@ -1794,6 +2147,7 @@ mod tests {
 
             /// Monotonicity: increasing gap should never increase remaining
             /// (for same prior state and config)
+            // @lat: [[tests#DHW no crossover#Larger temperature gaps never increase remaining litres]]
             #[test]
             fn no_crossover_monotonic_in_gap(
                 cfg in arb_cfg(),
@@ -1825,6 +2179,7 @@ mod tests {
             }
 
             /// Standby decay: effective_t1 never increases with time
+            // @lat: [[tests#DHW standby decay#Effective top temperature never rises during standby]]
             #[test]
             fn standby_decay_t1_never_increases(
                 cfg in arb_cfg(),

@@ -18,20 +18,26 @@ open http://10.0.1.230:3030
 
 ## What It Does
 
-- **Motion → lights**: Two Aqara motion sensors trigger hall and landing lights when dark enough (illuminance ≤ 15 lx). Auto-off after 5 minutes. Manual switch-off cancels the automation.
-- **Hot water gauge**: Physics-based DHW model tracking remaining litres from a 300L cylinder (177L usable). Uses crossover detection, thermocline tracking, T1/HwcStorage sensors, and standby decay. Config in `/etc/z2m-hub.toml`, capacity autoloaded from InfluxDB inflection data.
-- **DHW boost**: One-tap button sends a charge request to the heat pump via eBUS. Shows Top/Lower cylinder temperatures.
-- **Light toggles**: On/off toggles for hall, landing, and top landing SONOFF ZBMINI switches.
+- **Motion → lights**: Two Aqara motion sensors trigger hall and landing lights when dark enough.
+- **Hot water gauge**: A physics-based DHW model estimates remaining usable hot water.
+- **DHW boost**: One tap requests a charge cycle from the heat pump via eBUS.
+- **Light toggles**: The dashboard controls hall, landing, and top landing switches.
+- **Heating proxy**: The dashboard forwards heating mode controls to a separate LAN service.
 
 ## Documentation
 
-- [`AGENTS.md`](AGENTS.md) — LLM context: current operational truth (device list, API reference, infrastructure, automations). Update this first when operational facts change.
-- [`docs/code-truth/`](docs/code-truth/) — Code-derived stable documentation:
-  - [Overview & Map](docs/code-truth/REPO_OVERVIEW.md) — what's where, how to navigate
-  - [Architecture](docs/code-truth/ARCHITECTURE.md) — data flows, implicit contracts
-  - [Decisions](docs/code-truth/DECISIONS.md) — why things are the way they are
+- [`lat.md/`](lat.md/) — canonical current-state knowledge graph for architecture, domain rules, interfaces, infrastructure, and constraints
+  - [Graph entrypoint](lat.md/lat.md)
+  - [Runtime structure](lat.md/architecture.md)
+  - [Automations](lat.md/automations.md)
+  - [DHW tracking model](lat.md/dhw.md)
+  - [External interfaces](lat.md/interfaces.md)
+  - [Deployment and configuration](lat.md/infrastructure.md)
+  - [Operational constraints](lat.md/constraints.md)
+- [`docs/code-truth/`](docs/code-truth/) — code-derived navigation and architectural notes
+- [`AGENTS.md`](AGENTS.md) — agent workflow, commands, and repo-specific execution rules
 
-`AGENTS.md` is the canonical source for current operational truth. `docs/code-truth/` holds durable architecture and rationale — update these when the architecture actually changes, not for every operational tweak. When docs and code disagree, code wins.
+When docs and code disagree, code wins. When multiple docs could carry the same current-state fact, prefer `lat.md/` as the authoritative home.
 
 ## About This Code
 

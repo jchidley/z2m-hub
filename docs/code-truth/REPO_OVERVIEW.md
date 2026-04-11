@@ -20,11 +20,13 @@ Single-binary Rust server replacing Home Assistant for a LAN-only Zigbee + heat 
 ## File Organisation
 
 ```
-src/main.rs           ← entire application (~1520 lines, single file)
+src/main.rs           ← entire application (single-file service; currently 1847 lines)
 Cargo.toml            ← dependencies
 .cargo/config.toml    ← aarch64 cross-compile linker config
 vendor/zigbee2mqtt/   ← submodule pinned to 2.9.1 (reference only)
-AGENTS.md             ← LLM context (comprehensive, kept current)
+lat.md/               ← canonical current-state knowledge graph
+AGENTS.md             ← agent workflow and repo execution rules
+README.md             ← human-facing signposting and build/deploy basics
 docs/code-truth/      ← code-derived documentation (this directory)
 ```
 

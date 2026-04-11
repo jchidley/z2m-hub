@@ -1,2 +1,7 @@
 /target
 /proptest-regressions
+.claude
+.mcp.json
+.pi
+.codex
+lat.md/.cache/
