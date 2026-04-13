@@ -62,3 +62,11 @@ The model cools the effective top temperature over time without deleting litres 
 Configured capacity can be upgraded at startup from a recommended database value and the live estimate is written back after updates.
 
 `z2m-hub.toml` provides defaults and sane bounds. At startup, the service loads `recommended_full_litres` from the `dhw_capacity` table in PostgreSQL, takes the max of config and recommended values when the recommendation is sane, and writes the current estimate back to the `dhw` table during operation.
+
+The runtime contract is one-way and defensive: a sane database recommendation may increase `full_litres`, but it must never decrease it. If the recommendation is absent, stale, or outside sane bounds, z2m-hub keeps the configured capacity.
+
+## Restart recovery
+
+A process restart must reconstruct DHW tracking from persisted PostgreSQL state without operator intervention.
+
+On startup, z2m-hub reloads the latest `remaining_litres` row from `dhw`, combines it with the current Multical cumulative volume register, and reconstructs `volume_at_reset` so draw tracking resumes from the right offset instead of treating the next shower as a fresh cylinder. If the persisted row is missing or unusable, the broader fail-safe contract from [[constraints#Restart recovery assumptions]] still applies: the model can fall back to safe defaults and recover from new live readings.

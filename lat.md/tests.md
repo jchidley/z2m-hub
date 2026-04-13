@@ -378,7 +378,7 @@ All write-path live-PG tests must run inside a transaction and roll it back befo
 
 A `query_pg_f64` call against real `multical` must return a plausible temperature and a non-empty RFC3339 timestamp string.
 
-This proves the new PG transport produces the same `(f64, String)` tuple shape as the old Flux CSV parser.
+This proves the PG transport produces the `(f64, String)` tuple shape expected by its callers.
 
 ### INSERT includes explicit time column
 
