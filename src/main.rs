@@ -1178,24 +1178,30 @@ async fn is_charging() -> bool {
     status.ends_with(";hwc") || sfmode == "load"
 }
 
-/// Build the InfluxDB line-protocol payload for the current DHW state.
-///
-/// Retained as a golden-reference formatter so pre-migration regression tests
-/// can verify LP-to-INSERT field equivalence.
-#[cfg(test)]
-fn format_dhw_line_protocol(s: &DhwState) -> String {
-    format!(
-        "dhw remaining_litres={:.1},model_version=2i,t1={:.2},hwc_storage={:.2},\
-         effective_t1={:.2},charge_state=\"{}\",crossover={},bottom_zone_hot={}",
-        s.remaining,
-        s.current_t1,
-        s.current_hwc,
-        s.effective_t1,
-        s.charge_state,
-        s.crossover_achieved,
+#[derive(Debug, Clone, PartialEq)]
+struct DhwWriteRow {
+    remaining_litres: f64,
+    model_version: i32,
+    t1: f64,
+    hwc_storage: f64,
+    effective_t1: f64,
+    charge_state: String,
+    crossover: bool,
+    bottom_zone_hot: bool,
+}
+
+fn dhw_write_row(s: &DhwState) -> DhwWriteRow {
+    DhwWriteRow {
+        remaining_litres: s.remaining,
+        model_version: 2,
+        t1: s.current_t1,
+        hwc_storage: s.current_hwc,
+        effective_t1: s.effective_t1,
+        charge_state: s.charge_state.to_string(),
+        crossover: s.crossover_achieved,
         // Bottom zone is "hot" when HwcStorage is significantly above mains (~20°C)
-        s.current_hwc > 30.0,
-    )
+        bottom_zone_hot: s.current_hwc > 30.0,
+    }
 }
 
 /// Write current DHW state to PostgreSQL. Fire-and-forget: logs errors but
@@ -1204,20 +1210,21 @@ async fn write_dhw_to_pg<C>(pg: &C, s: &DhwState)
 where
     C: tokio_postgres::GenericClient + Sync,
 {
+    let row = dhw_write_row(s);
     let result = pg
         .execute(
             "INSERT INTO dhw (time, remaining_litres, model_version, t1, hwc_storage, \
              effective_t1, charge_state, crossover, bottom_zone_hot) \
              VALUES (now(), $1, $2, $3, $4, $5, $6, $7, $8)",
             &[
-                &s.remaining,
-                &2i32,
-                &s.current_t1,
-                &s.current_hwc,
-                &s.effective_t1,
-                &s.charge_state.to_string(),
-                &s.crossover_achieved,
-                &(s.current_hwc > 30.0),
+                &row.remaining_litres,
+                &row.model_version,
+                &row.t1,
+                &row.hwc_storage,
+                &row.effective_t1,
+                &row.charge_state,
+                &row.crossover,
+                &row.bottom_zone_hot,
             ],
         )
         .await;
@@ -1371,6 +1378,87 @@ fn reconstruct_volume_at_reset(full_litres: f64, remaining: f64, volume_now: f64
     volume_now - already_drawn
 }
 
+#[derive(Debug, Clone, Copy)]
+struct LiveDhwTick {
+    charging: bool,
+    volume_now: f64,
+    t1_now: f64,
+    hwc_now: f64,
+    dhw_flow: f64,
+}
+
+fn apply_startup_recovery(
+    s: &mut DhwState,
+    remaining: f64,
+    volume_now: f64,
+    charging: bool,
+    t1_now: f64,
+    hwc_now: f64,
+) {
+    s.remaining = remaining;
+    s.volume_at_reset = reconstruct_volume_at_reset(s.full_litres, remaining, volume_now);
+    s.was_charging = charging;
+    s.current_t1 = t1_now;
+    s.current_hwc = hwc_now;
+    s.effective_t1 = t1_now;
+    s.t1_at_charge_end = t1_now;
+    if charging {
+        s.t1_at_charge_start = t1_now;
+        s.charge_state = DhwChargeState::ChargingBelow;
+    }
+}
+
+fn apply_live_dhw_tick(s: &mut DhwState, cfg: &DhwConfig, tick: LiveDhwTick) -> bool {
+    let mut should_write = false;
+
+    s.current_t1 = tick.t1_now;
+    s.current_hwc = tick.hwc_now;
+
+    if tick.charging && !s.was_charging {
+        s.t1_at_charge_start = tick.t1_now;
+        s.crossover_achieved = false;
+        s.charge_state = DhwChargeState::ChargingBelow;
+    }
+
+    if tick.charging && !s.crossover_achieved && tick.hwc_now >= s.t1_at_charge_start {
+        s.crossover_achieved = true;
+        s.charge_state = DhwChargeState::ChargingUniform;
+    }
+
+    if s.was_charging && !tick.charging {
+        apply_charge_completion(s, cfg, tick.t1_now, tick.hwc_now);
+        s.volume_at_reset = tick.volume_now;
+        s.hwc_crash_detected = false;
+        should_write = true;
+    }
+
+    let is_drawing = tick.dhw_flow > cfg.draw_flow_min;
+
+    if is_drawing && !s.drawing {
+        s.drawing = true;
+        s.hwc_pre_draw = tick.hwc_now;
+        s.t1_pre_draw = tick.t1_now;
+        s.hwc_crash_detected = false;
+    }
+
+    if tick.volume_now > s.volume_at_reset {
+        apply_draw_tracking(s, cfg, tick.volume_now, tick.t1_now, tick.hwc_now);
+        should_write = true;
+    }
+
+    if s.drawing && !is_drawing {
+        s.drawing = false;
+        should_write = true;
+    }
+
+    if !tick.charging && !s.drawing {
+        apply_standby_decay(s, cfg);
+    }
+
+    s.was_charging = tick.charging;
+    should_write
+}
+
 async fn dhw_tracking_loop(
     state: Arc<Mutex<DhwState>>,
     pg: Arc<dyn PgAccess>,
@@ -1427,18 +1515,7 @@ async fn dhw_tracking_loop(
         let hwc = get_hwc_storage_temp().await;
 
         let mut s = state.lock().await;
-        s.remaining = remaining;
-        s.volume_at_reset = reconstruct_volume_at_reset(s.full_litres, remaining, volume);
-        s.was_charging = charging;
-        s.current_t1 = t1;
-        s.current_hwc = hwc;
-        s.effective_t1 = t1; // Best guess on startup
-        s.t1_at_charge_end = t1;
-        // If we're already charging on startup, capture T1 for crossover detection
-        if charging {
-            s.t1_at_charge_start = t1;
-            s.charge_state = DhwChargeState::ChargingBelow;
-        }
+        apply_startup_recovery(&mut s, remaining, volume, charging, t1, hwc);
         info!(
             "DHW init: remaining={remaining:.1}L, full={:.0}L, volume={volume:.1}, \
              T1={t1:.1}, HwcS={hwc:.1}, charging={charging}",
@@ -1450,89 +1527,19 @@ async fn dhw_tracking_loop(
     loop {
         interval.tick().await;
 
-        // Read all sensors
-        let charging = is_charging().await;
-        let volume_now = get_current_volume(pg.as_ref()).await;
-        let t1_now = get_current_t1(pg.as_ref()).await;
-        let hwc_now = get_hwc_storage_temp().await;
-        let dhw_flow = get_current_dhw_flow(pg.as_ref()).await;
+        let tick = LiveDhwTick {
+            charging: is_charging().await,
+            volume_now: get_current_volume(pg.as_ref()).await,
+            t1_now: get_current_t1(pg.as_ref()).await,
+            hwc_now: get_hwc_storage_temp().await,
+            dhw_flow: get_current_dhw_flow(pg.as_ref()).await,
+        };
 
         let mut s = state.lock().await;
-
-        // Update cached sensor values
-        s.current_t1 = t1_now;
-        s.current_hwc = hwc_now;
-
-        // ── Charging state machine ──────────────────────────────────────
-
-        if charging && !s.was_charging {
-            // Charge just started
-            s.t1_at_charge_start = t1_now;
-            s.crossover_achieved = false;
-            s.charge_state = DhwChargeState::ChargingBelow;
-            info!(
-                "DHW charge started: T1={t1_now:.1}, HwcS={hwc_now:.1}, \
-                 crossover target={t1_now:.1}"
-            );
-        }
-
-        if charging {
-            // Monitor for crossover: HwcStorage reaches T1 at charge start
-            if !s.crossover_achieved && hwc_now >= s.t1_at_charge_start {
-                s.crossover_achieved = true;
-                s.charge_state = DhwChargeState::ChargingUniform;
-                info!(
-                    "DHW CROSSOVER achieved: HwcS={hwc_now:.1} ≥ T1_start={:.1}",
-                    s.t1_at_charge_start
-                );
-            }
-        }
-
-        if s.was_charging && !charging {
-            // ── Charge just ended ───────────────────────────────────────
-            apply_charge_completion(&mut s, cfg, t1_now, hwc_now);
-            s.volume_at_reset = volume_now;
-            s.hwc_crash_detected = false;
+        let should_write = apply_live_dhw_tick(&mut s, cfg, tick);
+        if should_write {
             pg.write_dhw(&s).await;
         }
-
-        // ── Draw detection and tracking ─────────────────────────────────
-
-        // dhw_flow is from the Multical tap-side meter — independent of HP circuit.
-        // Draws during charging still deplete the cylinder and must be tracked.
-        let is_drawing = dhw_flow > cfg.draw_flow_min;
-
-        if is_drawing && !s.drawing {
-            // Draw just started
-            s.drawing = true;
-            s.hwc_pre_draw = hwc_now;
-            s.t1_pre_draw = t1_now;
-            s.hwc_crash_detected = false;
-            info!("DHW draw started: T1={t1_now:.1}, HwcS={hwc_now:.1}");
-        }
-
-        if volume_now > s.volume_at_reset {
-            apply_draw_tracking(&mut s, cfg, volume_now, t1_now, hwc_now);
-            pg.write_dhw(&s).await;
-        }
-
-        if s.drawing && !is_drawing {
-            // Draw ended
-            s.drawing = false;
-            info!(
-                "DHW draw ended: remaining={:.0}L, T1={t1_now:.1}, HwcS={hwc_now:.1}",
-                s.remaining
-            );
-            pg.write_dhw(&s).await;
-        }
-
-        // ── Standby decay ───────────────────────────────────────────────
-
-        if !charging && !s.drawing {
-            apply_standby_decay(&mut s, cfg);
-        }
-
-        s.was_charging = charging;
     }
 }
 
@@ -1781,7 +1788,9 @@ mod tests {
     }
 
     fn with_env_var_removed<T>(name: &str, f: impl FnOnce() -> T) -> T {
-        let _guard = env_lock().lock().expect("lock env guard");
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let original = std::env::var(name).ok();
         std::env::remove_var(name);
         let result = f();
@@ -1789,6 +1798,40 @@ mod tests {
             Some(value) => std::env::set_var(name, value),
             None => std::env::remove_var(name),
         }
+        result
+    }
+
+    fn with_password_env<T>(
+        credentials_directory: Option<&str>,
+        pgpassword: Option<&str>,
+        f: impl FnOnce() -> T,
+    ) -> T {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let original_credentials_directory = std::env::var("CREDENTIALS_DIRECTORY").ok();
+        let original_pgpassword = std::env::var("PGPASSWORD").ok();
+
+        match credentials_directory {
+            Some(value) => std::env::set_var("CREDENTIALS_DIRECTORY", value),
+            None => std::env::remove_var("CREDENTIALS_DIRECTORY"),
+        }
+        match pgpassword {
+            Some(value) => std::env::set_var("PGPASSWORD", value),
+            None => std::env::remove_var("PGPASSWORD"),
+        }
+
+        let result = f();
+
+        match original_credentials_directory {
+            Some(value) => std::env::set_var("CREDENTIALS_DIRECTORY", value),
+            None => std::env::remove_var("CREDENTIALS_DIRECTORY"),
+        }
+        match original_pgpassword {
+            Some(value) => std::env::set_var("PGPASSWORD", value),
+            None => std::env::remove_var("PGPASSWORD"),
+        }
+
         result
     }
 
@@ -1833,6 +1876,7 @@ mod tests {
     #[derive(Default)]
     struct FakePg {
         query_results: StdMutex<std::collections::HashMap<String, (f64, String)>>,
+        queries: StdMutex<Vec<String>>,
     }
 
     impl FakePg {
@@ -1843,11 +1887,22 @@ mod tests {
                 .insert(query.to_string(), (value, timestamp.to_string()));
             self
         }
+
+        fn recorded_queries(&self) -> Vec<String> {
+            self.queries
+                .lock()
+                .expect("fake pg queries mutex")
+                .clone()
+        }
     }
 
     #[async_trait]
     impl PgAccess for FakePg {
         async fn query_f64(&self, query: &str) -> (f64, String) {
+            self.queries
+                .lock()
+                .expect("fake pg queries mutex")
+                .push(query.to_string());
             self.query_results
                 .lock()
                 .expect("fake pg query results mutex")
@@ -1872,6 +1927,19 @@ mod tests {
 
     fn dead_test_pg() -> Arc<dyn PgAccess> {
         Arc::new(FakePg::default())
+    }
+
+    fn unreachable_pg_config() -> DatabaseConfig {
+        let addr = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .expect("bind ephemeral port for unreachable pg config")
+            .local_addr()
+            .expect("read unreachable pg config addr");
+        DatabaseConfig {
+            host: "127.0.0.1".to_string(),
+            port: addr.port(),
+            dbname: "test".to_string(),
+            user: "test".to_string(),
+        }
     }
 
     fn heating_test_lock() -> &'static Mutex<()> {
@@ -1960,6 +2028,69 @@ mod tests {
             axum::serve(listener, app)
                 .await
                 .expect("run heating test server");
+        })
+    }
+
+    async fn spawn_heating_invalid_json_server(
+        requests: Arc<std::sync::Mutex<Vec<(String, Option<serde_json::Value>)>>>,
+    ) -> tokio::task::JoinHandle<()> {
+        use axum::{
+            body::Body,
+            http::{Response, StatusCode},
+            response::IntoResponse,
+        };
+
+        let app = axum::Router::new()
+            .route(
+                "/status",
+                axum::routing::get({
+                    let requests = requests.clone();
+                    move || {
+                        let requests = requests.clone();
+                        async move {
+                            requests
+                                .lock()
+                                .expect("recorded requests mutex")
+                                .push(("GET /status".to_string(), None));
+                            Response::builder()
+                                .status(StatusCode::OK)
+                                .header("content-type", "application/json")
+                                .body(Body::from("not-json"))
+                                .expect("build invalid json response")
+                                .into_response()
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/mode/{mode}",
+                axum::routing::post({
+                    let requests = requests.clone();
+                    move |axum::extract::Path(mode): axum::extract::Path<String>| {
+                        let requests = requests.clone();
+                        async move {
+                            requests
+                                .lock()
+                                .expect("recorded requests mutex")
+                                .push((format!("POST /mode/{mode}"), None));
+                            Response::builder()
+                                .status(StatusCode::OK)
+                                .header("content-type", "application/json")
+                                .body(Body::from("not-json"))
+                                .expect("build invalid json response")
+                                .into_response()
+                        }
+                    }
+                }),
+            );
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 3031))
+            .await
+            .expect("bind heating invalid json test server");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("run heating invalid json test server");
         })
     }
 
@@ -2427,6 +2558,22 @@ gap_dissolved = 2.0
         });
     }
 
+    // @lat: [[tests#Password resolution#Systemd credential takes precedence over PGPASSWORD]]
+    #[test]
+    fn systemd_credential_takes_precedence_over_pgpassword() {
+        let dir = format!("/tmp/z2m-creds-priority-{}", std::process::id());
+        std::fs::create_dir_all(&dir).expect("create temp creds dir");
+        std::fs::write(format!("{dir}/pgpassword"), "cred-secret\n").expect("write cred file");
+
+        with_password_env(Some(&dir), Some("env-secret"), || {
+            let cfg = DatabaseConfig::default();
+            let pw = cfg.resolve_password();
+            assert_eq!(pw.as_deref(), Some("cred-secret"));
+        });
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // @lat: [[tests#Password resolution#Connection string includes resolved password]]
     #[test]
     fn connection_string_includes_resolved_password() {
@@ -2448,6 +2595,22 @@ gap_dissolved = 2.0
                 "conn string must include password: {conn}"
             );
         });
+    }
+
+    // @lat: [[tests#Password resolution#Blank systemd credential falls back to PGPASSWORD]]
+    #[test]
+    fn blank_systemd_credential_falls_back_to_pgpassword() {
+        let dir = format!("/tmp/z2m-creds-blank-{}", std::process::id());
+        std::fs::create_dir_all(&dir).expect("create temp creds dir");
+        std::fs::write(format!("{dir}/pgpassword"), "   \n").expect("write blank cred file");
+
+        with_password_env(Some(&dir), Some("env-secret"), || {
+            let cfg = DatabaseConfig::default();
+            let pw = cfg.resolve_password();
+            assert_eq!(pw.as_deref(), Some("env-secret"));
+        });
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // @lat: [[tests#Password resolution#Connection string omits password when none resolved]]
@@ -2492,25 +2655,99 @@ gap_dissolved = 2.0
         assert_eq!(return_temp, 0.0);
     }
 
-    // ── DHW write format (pre-migration regression) ───────────────────
+    // @lat: [[tests#eBUS interface#Hwc storage helper parses numeric replies and defaults to zero]]
+    #[tokio::test]
+    async fn hwc_storage_helper_parses_numeric_reply_and_defaults_to_zero() {
+        let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let responses = Arc::new(std::collections::HashMap::from([(
+            "read -f -c 700 HwcStorageTemp".to_string(),
+            "47.25".to_string(),
+        )]));
+        let ebusd = spawn_ebusd_test_server(responses, commands.clone()).await;
 
-    // @lat: [[tests#DHW write format#LP golden snapshot matches expected field layout]]
-    #[test]
-    fn lp_golden_snapshot_matches_expected_field_layout() {
-        let s = test_state(); // full_litres=177, remaining=100, t1=50, hwc=48, effective=50, Full, no crossover
+        let temp = get_hwc_storage_temp().await;
 
-        let lp = format_dhw_line_protocol(&s);
-
+        ebusd.await.expect("ebusd task");
+        assert_eq!(temp, 47.25);
         assert_eq!(
-            lp,
-            "dhw remaining_litres=100.0,model_version=2i,t1=50.00,hwc_storage=48.00,\
-             effective_t1=50.00,charge_state=\"full\",crossover=false,bottom_zone_hot=true"
+            commands.lock().expect("recorded commands mutex").as_slice(),
+            &["read -f -c 700 HwcStorageTemp".to_string()]
+        );
+
+        let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let responses = Arc::new(std::collections::HashMap::from([(
+            "read -f -c 700 HwcStorageTemp".to_string(),
+            "not-a-number".to_string(),
+        )]));
+        let ebusd = spawn_ebusd_test_server(responses, commands.clone()).await;
+
+        let temp = get_hwc_storage_temp().await;
+
+        ebusd.await.expect("ebusd task");
+        assert_eq!(temp, 0.0);
+        assert_eq!(
+            commands.lock().expect("recorded commands mutex").as_slice(),
+            &["read -f -c 700 HwcStorageTemp".to_string()]
         );
     }
 
-    // @lat: [[tests#DHW write format#LP payload includes all eight fields with correct types]]
+    // @lat: [[tests#eBUS interface#Charging helper treats either sfmode load or Status01 hwc as charging]]
+    #[tokio::test]
+    async fn charging_helper_treats_either_sfmode_load_or_status01_hwc_as_charging() {
+        let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let responses = Arc::new(std::collections::HashMap::from([
+            (
+                "read -f -c 700 HwcSFMode".to_string(),
+                "auto".to_string(),
+            ),
+            (
+                "read -f -c hmu Status01".to_string(),
+                "50.0;37.5;8.0;55.0;49.0;hwc".to_string(),
+            ),
+        ]));
+        let ebusd = spawn_ebusd_test_server(responses, commands.clone()).await;
+
+        assert!(is_charging().await);
+
+        ebusd.await.expect("ebusd task");
+        assert_eq!(
+            commands.lock().expect("recorded commands mutex").as_slice(),
+            &[
+                "read -f -c 700 HwcSFMode".to_string(),
+                "read -f -c hmu Status01".to_string(),
+            ]
+        );
+
+        let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let responses = Arc::new(std::collections::HashMap::from([
+            (
+                "read -f -c 700 HwcSFMode".to_string(),
+                "idle".to_string(),
+            ),
+            (
+                "read -f -c hmu Status01".to_string(),
+                "50.0;37.5;8.0;55.0;49.0;off".to_string(),
+            ),
+        ]));
+        let ebusd = spawn_ebusd_test_server(responses, commands.clone()).await;
+
+        assert!(!is_charging().await);
+
+        ebusd.await.expect("ebusd task");
+        assert_eq!(
+            commands.lock().expect("recorded commands mutex").as_slice(),
+            &[
+                "read -f -c 700 HwcSFMode".to_string(),
+                "read -f -c hmu Status01".to_string(),
+            ]
+        );
+    }
+
+    // ── PostgreSQL write-row mapping ─────────────────────────────────
+
+    // @lat: [[tests#PostgreSQL interface#Write row maps all dhw columns from state]]
     #[test]
-    fn lp_payload_includes_all_eight_fields_with_correct_types() {
+    fn dhw_write_row_maps_all_dhw_columns_from_state() {
         let mut s = test_state();
         s.remaining = 134.5;
         s.current_t1 = 51.23;
@@ -2519,57 +2756,52 @@ gap_dissolved = 2.0
         s.charge_state = DhwChargeState::Full;
         s.crossover_achieved = true;
 
-        let lp = format_dhw_line_protocol(&s);
+        let row = dhw_write_row(&s);
 
-        assert!(lp.starts_with("dhw "), "measurement must be 'dhw'");
-        assert!(lp.contains("remaining_litres=134.5"));
-        assert!(
-            lp.contains("model_version=2i"),
-            "model_version must be integer-typed"
+        assert_eq!(
+            row,
+            DhwWriteRow {
+                remaining_litres: 134.5,
+                model_version: 2,
+                t1: 51.23,
+                hwc_storage: 47.89,
+                effective_t1: 49.67,
+                charge_state: "full".to_string(),
+                crossover: true,
+                bottom_zone_hot: true,
+            }
         );
-        assert!(lp.contains("t1=51.23"));
-        assert!(lp.contains("hwc_storage=47.89"));
-        assert!(lp.contains("effective_t1=49.67"));
-        assert!(lp.contains("charge_state=\"full\""));
-        assert!(lp.contains("crossover=true"));
-        assert!(lp.contains("bottom_zone_hot=true"), "47.89 > 30 → hot");
     }
 
-    // @lat: [[tests#DHW write format#Bottom zone hot threshold at thirty degrees]]
+    // @lat: [[tests#PostgreSQL interface#Bottom zone hot threshold at thirty degrees]]
     #[test]
     fn bottom_zone_hot_threshold_at_thirty_degrees() {
         let mut s = test_state();
 
-        // Just above threshold
         s.current_hwc = 30.1;
-        assert!(format_dhw_line_protocol(&s).contains("bottom_zone_hot=true"));
+        assert!(dhw_write_row(&s).bottom_zone_hot);
 
-        // At threshold — not hot (strict >30)
         s.current_hwc = 30.0;
-        assert!(format_dhw_line_protocol(&s).contains("bottom_zone_hot=false"));
+        assert!(!dhw_write_row(&s).bottom_zone_hot);
 
-        // Below threshold
         s.current_hwc = 20.0;
-        assert!(format_dhw_line_protocol(&s).contains("bottom_zone_hot=false"));
+        assert!(!dhw_write_row(&s).bottom_zone_hot);
     }
 
-    // @lat: [[tests#DHW write format#LP encodes all charge states correctly]]
+    // @lat: [[tests#PostgreSQL interface#Charge state strings match dhw schema values]]
     #[test]
-    fn lp_encodes_all_charge_states_correctly() {
+    fn dhw_write_row_encodes_all_charge_states_correctly() {
         let mut s = test_state();
         for (state, expected) in [
-            (DhwChargeState::Full, "\"full\""),
-            (DhwChargeState::Partial, "\"partial\""),
-            (DhwChargeState::Standby, "\"standby\""),
-            (DhwChargeState::ChargingBelow, "\"charging_below\""),
-            (DhwChargeState::ChargingUniform, "\"charging_uniform\""),
+            (DhwChargeState::Full, "full"),
+            (DhwChargeState::Partial, "partial"),
+            (DhwChargeState::Standby, "standby"),
+            (DhwChargeState::ChargingBelow, "charging_below"),
+            (DhwChargeState::ChargingUniform, "charging_uniform"),
         ] {
             s.charge_state = state;
-            let lp = format_dhw_line_protocol(&s);
-            assert!(
-                lp.contains(&format!("charge_state={expected}")),
-                "state {expected} not found in: {lp}"
-            );
+            let row = dhw_write_row(&s);
+            assert_eq!(row.charge_state, expected, "wrong string for {state:?}");
         }
     }
 
@@ -2589,7 +2821,89 @@ gap_dissolved = 2.0
         assert_eq!(timestamp, "");
     }
 
-    // @lat: [[tests#DHW write format#Write failure does not stop the caller]]
+    // @lat: [[tests#PostgreSQL interface#Reconnecting reader returns zero defaults when connect fails]]
+    #[tokio::test]
+    async fn reconnecting_reader_returns_zero_defaults_when_connect_fails() {
+        let pg = ReconnectingPg::new(unreachable_pg_config());
+
+        let (value, timestamp) = pg
+            .query_f64("SELECT dhw_t1, time FROM multical ORDER BY time DESC LIMIT 1")
+            .await;
+
+        assert_eq!(value, 0.0);
+        assert_eq!(timestamp, "");
+    }
+
+    // @lat: [[tests#PostgreSQL interface#Reconnecting writer ignores connect failures before a session exists]]
+    #[tokio::test]
+    async fn reconnecting_writer_ignores_connect_failures_before_a_session_exists() {
+        let pg = ReconnectingPg::new(unreachable_pg_config());
+        let s = test_state();
+
+        pg.write_dhw(&s).await;
+    }
+
+    // @lat: [[tests#PostgreSQL interface#DHW polling helpers query the intended columns and windows]]
+    #[tokio::test]
+    async fn dhw_polling_helpers_query_the_intended_columns_and_windows() {
+        let fake_pg = Arc::new(
+            FakePg::default()
+                .with_query_result(
+                    "SELECT dhw_volume_v1, time FROM multical \
+                     WHERE time >= now() - interval '1 hour' \
+                     ORDER BY time DESC LIMIT 1",
+                    123.4,
+                    "2026-01-01T00:00:00Z",
+                )
+                .with_query_result(
+                    "SELECT dhw_t1, time FROM multical \
+                     WHERE time >= now() - interval '1 hour' \
+                     ORDER BY time DESC LIMIT 1",
+                    54.5,
+                    "2026-01-01T00:00:00Z",
+                )
+                .with_query_result(
+                    "SELECT dhw_flow, time FROM multical \
+                     WHERE time >= now() - interval '5 minutes' \
+                     ORDER BY time DESC LIMIT 1",
+                    8.75,
+                    "2026-01-01T00:00:00Z",
+                ),
+        );
+
+        assert_eq!(get_current_volume(fake_pg.as_ref()).await, 123.4);
+        assert_eq!(get_current_t1(fake_pg.as_ref()).await, 54.5);
+        assert_eq!(get_current_dhw_flow(fake_pg.as_ref()).await, 8.75);
+        assert_eq!(
+            fake_pg.recorded_queries(),
+            vec![
+                "SELECT dhw_volume_v1, time FROM multical \
+                 WHERE time >= now() - interval '1 hour' \
+                 ORDER BY time DESC LIMIT 1"
+                    .to_string(),
+                "SELECT dhw_t1, time FROM multical \
+                 WHERE time >= now() - interval '1 hour' \
+                 ORDER BY time DESC LIMIT 1"
+                    .to_string(),
+                "SELECT dhw_flow, time FROM multical \
+                 WHERE time >= now() - interval '5 minutes' \
+                 ORDER BY time DESC LIMIT 1"
+                    .to_string(),
+            ]
+        );
+    }
+
+    // @lat: [[tests#PostgreSQL interface#DHW polling helpers default to zero when PostgreSQL returns no row]]
+    #[tokio::test]
+    async fn dhw_polling_helpers_default_to_zero_when_postgres_returns_no_row() {
+        let fake_pg = FakePg::default();
+
+        assert_eq!(get_current_volume(&fake_pg).await, 0.0);
+        assert_eq!(get_current_t1(&fake_pg).await, 0.0);
+        assert_eq!(get_current_dhw_flow(&fake_pg).await, 0.0);
+    }
+
+    // @lat: [[tests#PostgreSQL interface#Write failure does not stop the caller]]
     #[tokio::test]
     async fn write_failure_does_not_stop_the_caller() {
         // Dead PG client — connection has been dropped, every query fails
@@ -2600,7 +2914,7 @@ gap_dissolved = 2.0
         write_dhw_to_pg(pg.as_ref(), &s).await;
     }
 
-    // @lat: [[tests#DHW write format#Write to unreachable server does not stop the caller]]
+    // @lat: [[tests#PostgreSQL interface#Write to unreachable server does not stop the caller]]
     #[tokio::test]
     async fn write_to_unreachable_server_does_not_stop_the_caller() {
         // Dead PG client — simulates unreachable server
@@ -2665,6 +2979,130 @@ gap_dissolved = 2.0
         assert_eq!(reconstruct_volume_at_reset(177.0, 200.0, 1000.0), 1000.0);
     }
 
+    // @lat: [[tests#DHW startup#Startup recovery hydrates cached sensors and volume offset]]
+    #[test]
+    fn startup_recovery_hydrates_cached_sensors_and_volume_offset() {
+        let mut s = test_state();
+        s.full_litres = 177.0;
+        s.remaining = 5.0;
+        s.volume_at_reset = 0.0;
+        s.was_charging = false;
+        s.current_t1 = 0.0;
+        s.current_hwc = 0.0;
+        s.effective_t1 = 0.0;
+        s.t1_at_charge_end = 0.0;
+        s.charge_state = DhwChargeState::Standby;
+
+        apply_startup_recovery(&mut s, 111.0, 1000.0, false, 49.5, 46.0);
+
+        assert_eq!(s.remaining, 111.0);
+        assert_eq!(s.volume_at_reset, 934.0);
+        assert!(!s.was_charging);
+        assert_eq!(s.current_t1, 49.5);
+        assert_eq!(s.current_hwc, 46.0);
+        assert_eq!(s.effective_t1, 49.5);
+        assert_eq!(s.t1_at_charge_end, 49.5);
+        assert_eq!(s.charge_state, DhwChargeState::Standby);
+    }
+
+    // @lat: [[tests#DHW startup#Startup recovery while charging captures the charge start baseline]]
+    #[test]
+    fn startup_recovery_while_charging_captures_the_charge_start_baseline() {
+        let mut s = test_state();
+        s.t1_at_charge_start = 0.0;
+        s.charge_state = DhwChargeState::Standby;
+
+        apply_startup_recovery(&mut s, 90.0, 1200.0, true, 47.0, 43.0);
+
+        assert!(s.was_charging);
+        assert_eq!(s.t1_at_charge_start, 47.0);
+        assert_eq!(s.charge_state, DhwChargeState::ChargingBelow);
+    }
+
+    // @lat: [[tests#DHW loop orchestration#Charge end resets volume and requests a write]]
+    #[test]
+    fn live_tick_charge_end_resets_volume_and_requests_a_write() {
+        let cfg = test_cfg();
+        let mut s = test_state();
+        s.was_charging = true;
+        s.crossover_achieved = true;
+        s.hwc_crash_detected = true;
+        s.volume_at_reset = 900.0;
+        s.charge_state = DhwChargeState::ChargingUniform;
+
+        let should_write = apply_live_dhw_tick(
+            &mut s,
+            &cfg,
+            LiveDhwTick {
+                charging: false,
+                volume_now: 1040.0,
+                t1_now: 51.0,
+                hwc_now: 49.0,
+                dhw_flow: 0.0,
+            },
+        );
+
+        assert!(should_write);
+        assert_eq!(s.remaining, s.full_litres);
+        assert_eq!(s.volume_at_reset, 1040.0);
+        assert!(!s.hwc_crash_detected);
+        assert_eq!(s.charge_state, DhwChargeState::Full);
+        assert!(!s.was_charging);
+    }
+
+    // @lat: [[tests#DHW loop orchestration#Draw start snapshots temperatures and clears prior crash state]]
+    #[test]
+    fn live_tick_draw_start_snapshots_temperatures_and_clears_prior_crash_state() {
+        let cfg = test_cfg();
+        let mut s = test_state();
+        s.drawing = false;
+        s.hwc_crash_detected = true;
+
+        let volume_at_reset = s.volume_at_reset;
+        let should_write = apply_live_dhw_tick(
+            &mut s,
+            &cfg,
+            LiveDhwTick {
+                charging: false,
+                volume_now: volume_at_reset,
+                t1_now: 48.5,
+                hwc_now: 44.5,
+                dhw_flow: cfg.draw_flow_min + 1.0,
+            },
+        );
+
+        assert!(!should_write);
+        assert!(s.drawing);
+        assert_eq!(s.t1_pre_draw, 48.5);
+        assert_eq!(s.hwc_pre_draw, 44.5);
+        assert!(!s.hwc_crash_detected);
+    }
+
+    // @lat: [[tests#DHW loop orchestration#Draw end clears drawing and requests a write]]
+    #[test]
+    fn live_tick_draw_end_clears_drawing_and_requests_a_write() {
+        let cfg = test_cfg();
+        let mut s = test_state();
+        s.drawing = true;
+        s.volume_at_reset = 1000.0;
+        s.remaining = 150.0;
+
+        let should_write = apply_live_dhw_tick(
+            &mut s,
+            &cfg,
+            LiveDhwTick {
+                charging: false,
+                volume_now: 1000.0,
+                t1_now: 49.0,
+                hwc_now: 47.0,
+                dhw_flow: 0.0,
+            },
+        );
+
+        assert!(should_write);
+        assert!(!s.drawing);
+    }
+
     // @lat: [[tests#Heating proxy#Heating proxy passes success JSON through unchanged]]
     #[test]
     fn heating_proxy_passes_success_json_through_unchanged() {
@@ -2705,6 +3143,27 @@ gap_dissolved = 2.0
         let Json(resp) = api_heating_status(State(state)).await;
 
         assert_eq!(resp, serde_json::json!({"ok": true, "status": "idle"}));
+        assert_eq!(
+            requests.lock().expect("recorded requests mutex").as_slice(),
+            &[("GET /status".to_string(), None)]
+        );
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    // @lat: [[tests#Heating proxy#Heating status invalid JSON keeps status error shape]]
+    #[tokio::test]
+    async fn heating_status_invalid_json_keeps_status_error_shape() {
+        let _guard = heating_test_lock().lock().await;
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let server = spawn_heating_invalid_json_server(requests.clone()).await;
+        let state = test_app_state(dead_test_pg());
+
+        let Json(resp) = api_heating_status(State(state)).await;
+
+        assert!(resp.get("ok").is_none(), "status errors must omit ok: {resp}");
+        assert!(resp["error"].as_str().is_some(), "status error text missing: {resp}");
         assert_eq!(
             requests.lock().expect("recorded requests mutex").as_slice(),
             &[("GET /status".to_string(), None)]
@@ -2770,6 +3229,31 @@ gap_dissolved = 2.0
         let _ = server.await;
     }
 
+    // @lat: [[tests#Heating proxy#Heating mode invalid JSON keeps ok false error shape]]
+    #[tokio::test]
+    async fn heating_mode_invalid_json_keeps_ok_false_error_shape() {
+        let _guard = heating_test_lock().lock().await;
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let server = spawn_heating_invalid_json_server(requests.clone()).await;
+        let state = test_app_state(dead_test_pg());
+
+        let Json(resp) = api_heating_mode(
+            State(state),
+            axum::extract::Path("comfort".to_string()),
+        )
+        .await;
+
+        assert_eq!(resp["ok"], serde_json::json!(false));
+        assert!(resp["error"].as_str().is_some(), "mode error text missing: {resp}");
+        assert_eq!(
+            requests.lock().expect("recorded requests mutex").as_slice(),
+            &[("POST /mode/comfort".to_string(), None)]
+        );
+
+        server.abort();
+        let _ = server.await;
+    }
+
     // ── HTTP handler tests ───────────────────────────────────────────────
 
     // @lat: [[tests#HTTP API#Light toggle uses cached ON state to send OFF]]
@@ -2818,22 +3302,67 @@ gap_dissolved = 2.0
         assert_eq!(msg.payload, serde_json::json!({"state": "ON"}));
     }
 
+    // @lat: [[tests#HTTP API#Light toggle treats malformed cached state as OFF]]
+    #[tokio::test]
+    async fn light_toggle_treats_malformed_cached_state_as_off() {
+        let state = test_app_state(dead_test_pg());
+        let mut cmd_rx = state.cmd_tx.subscribe();
+        {
+            let mut zs = state.z2m_state.lock().await;
+            zs.insert("landing".to_string(), serde_json::json!({"state": true}));
+        }
+
+        let Json(resp) = api_light_toggle(
+            State(state.clone()),
+            axum::extract::Path("landing".to_string()),
+        )
+        .await;
+
+        assert_eq!(resp["ok"], serde_json::json!(true));
+        assert_eq!(resp["light"], serde_json::json!("landing"));
+        assert_eq!(resp["state"], serde_json::json!("ON"));
+
+        let msg = cmd_rx.try_recv().expect("toggle should publish a command");
+        assert_eq!(msg.topic, "landing/set");
+        assert_eq!(msg.payload, serde_json::json!({"state": "ON"}));
+    }
+
     // @lat: [[tests#HTTP API#Unknown light commands fail without publishing Zigbee traffic]]
     #[tokio::test]
-    async fn unknown_light_command_fails_without_publishing() {
+    async fn unknown_light_commands_fail_without_publishing() {
         let state = test_app_state(dead_test_pg());
         let mut cmd_rx = state.cmd_tx.subscribe();
 
-        let Json(resp) = api_light_on(
+        let Json(on_resp) = api_light_on(
             State(state.clone()),
             axum::extract::Path("kitchen".to_string()),
         )
         .await;
-
         assert_eq!(
-            resp,
+            on_resp,
             serde_json::json!({"ok": false, "error": "unknown light"})
         );
+
+        let Json(off_resp) = api_light_off(
+            State(state.clone()),
+            axum::extract::Path("kitchen".to_string()),
+        )
+        .await;
+        assert_eq!(
+            off_resp,
+            serde_json::json!({"ok": false, "error": "unknown light"})
+        );
+
+        let Json(toggle_resp) = api_light_toggle(
+            State(state.clone()),
+            axum::extract::Path("kitchen".to_string()),
+        )
+        .await;
+        assert_eq!(
+            toggle_resp,
+            serde_json::json!({"ok": false, "error": "unknown light"})
+        );
+
         assert!(cmd_rx.try_recv().is_err());
     }
 
@@ -2894,6 +3423,24 @@ gap_dissolved = 2.0
             resp["lights"]["top_landing"]["on"],
             serde_json::json!(false)
         );
+    }
+
+    // @lat: [[tests#HTTP API#Lights state treats malformed cached state as off]]
+    #[tokio::test]
+    async fn lights_state_treats_malformed_cached_state_as_off() {
+        let state = test_app_state(dead_test_pg());
+        {
+            let mut zs = state.z2m_state.lock().await;
+            zs.insert("hall".to_string(), serde_json::json!({"state": true}));
+            zs.insert("landing".to_string(), serde_json::json!({"brightness": 128}));
+        }
+
+        let Json(resp) = api_lights_state(State(state)).await;
+
+        assert_eq!(resp["ok"], serde_json::json!(true));
+        assert_eq!(resp["lights"]["hall"]["on"], serde_json::json!(false));
+        assert_eq!(resp["lights"]["landing"]["on"], serde_json::json!(false));
+        assert_eq!(resp["lights"]["top_landing"]["on"], serde_json::json!(false));
     }
 
     // @lat: [[tests#HTTP API#Hot water endpoint returns the current DHW snapshot]]
@@ -3095,6 +3642,35 @@ gap_dissolved = 2.0
         assert!(zs.is_empty());
     }
 
+    // @lat: [[tests#HTTP API#Retained slashless Zigbee topics overwrite older cached state]]
+    #[tokio::test]
+    async fn slashless_non_bridge_topics_overwrite_older_cached_state() {
+        let state = test_automation_state();
+        let (cmd_tx, _cmd_rx) = broadcast::channel(8);
+        let z2m_state = Arc::new(Mutex::new(std::collections::HashMap::new()));
+
+        handle_z2m_message(
+            r#"{"topic":"top_landing","payload":{"state":"OFF","brightness":20}}"#,
+            &state,
+            &cmd_tx,
+            &z2m_state,
+        )
+        .await;
+        handle_z2m_message(
+            r#"{"topic":"top_landing","payload":{"state":"ON","brightness":180}}"#,
+            &state,
+            &cmd_tx,
+            &z2m_state,
+        )
+        .await;
+
+        let zs = z2m_state.lock().await;
+        assert_eq!(
+            zs.get("top_landing"),
+            Some(&serde_json::json!({"state": "ON", "brightness": 180}))
+        );
+    }
+
     // @lat: [[tests#Motion lighting automation#Dark motion turns on both motion lights and arms the timer]]
     #[tokio::test]
     async fn dark_motion_turns_on_both_motion_lights_and_arms_timer() {
@@ -3210,6 +3786,91 @@ gap_dissolved = 2.0
         assert_eq!(s.illuminance.get("landing_motion"), Some(&30.0));
     }
 
+    // @lat: [[tests#Motion lighting automation#Occupancy false refreshes cached lux without switching lights]]
+    #[tokio::test]
+    async fn occupancy_false_refreshes_cached_lux_without_switching_lights() {
+        let state = test_automation_state();
+        let (cmd_tx, mut cmd_rx) = broadcast::channel(8);
+        let z2m_state = Arc::new(Mutex::new(std::collections::HashMap::new()));
+
+        handle_z2m_message(
+            r#"{"topic":"landing_motion","payload":{"occupancy":false,"illuminance":7.5}}"#,
+            &state,
+            &cmd_tx,
+            &z2m_state,
+        )
+        .await;
+
+        assert!(cmd_rx.try_recv().is_err());
+
+        let s = state.lock().await;
+        assert!(s.lights_off_at.is_none());
+        assert_eq!(s.illuminance.get("landing_motion"), Some(&7.5));
+        drop(s);
+
+        let zs = z2m_state.lock().await;
+        assert_eq!(
+            zs.get("landing_motion"),
+            Some(&serde_json::json!({"occupancy": false, "illuminance": 7.5}))
+        );
+    }
+
+    // @lat: [[tests#Motion lighting automation#Illuminance-only reports refresh lux without switching lights]]
+    #[tokio::test]
+    async fn illuminance_only_reports_refresh_lux_without_switching_lights() {
+        let state = test_automation_state();
+        let (cmd_tx, mut cmd_rx) = broadcast::channel(8);
+        let z2m_state = Arc::new(Mutex::new(std::collections::HashMap::new()));
+
+        handle_z2m_message(
+            r#"{"topic":"hall_motion","payload":{"illuminance":11.0}}"#,
+            &state,
+            &cmd_tx,
+            &z2m_state,
+        )
+        .await;
+
+        assert!(cmd_rx.try_recv().is_err());
+
+        let s = state.lock().await;
+        assert!(s.lights_off_at.is_none());
+        assert_eq!(s.illuminance.get("hall_motion"), Some(&11.0));
+        drop(s);
+
+        let zs = z2m_state.lock().await;
+        assert_eq!(
+            zs.get("hall_motion"),
+            Some(&serde_json::json!({"illuminance": 11.0}))
+        );
+    }
+
+    // @lat: [[tests#Motion lighting automation#Active timer motion keeps the pre light lux sample]]
+    #[tokio::test]
+    async fn active_timer_motion_keeps_the_pre_light_lux_sample() {
+        let state = test_automation_state();
+        {
+            let mut s = state.lock().await;
+            s.lights_off_at = Some(tokio::time::Instant::now() + OFF_DELAY);
+            s.illuminance.insert("landing_motion".to_string(), 9.0);
+        }
+        let (cmd_tx, mut cmd_rx) = broadcast::channel(8);
+        let z2m_state = Arc::new(Mutex::new(std::collections::HashMap::new()));
+
+        handle_z2m_message(
+            r#"{"topic":"landing_motion","payload":{"occupancy":true,"illuminance":30.0}}"#,
+            &state,
+            &cmd_tx,
+            &z2m_state,
+        )
+        .await;
+
+        assert!(cmd_rx.try_recv().is_err());
+
+        let s = state.lock().await;
+        assert!(s.lights_off_at.is_some());
+        assert_eq!(s.illuminance.get("landing_motion"), Some(&9.0));
+    }
+
     // @lat: [[tests#Motion lighting automation#Manual off cancels the timer and suppresses retriggering]]
     #[tokio::test]
     async fn manual_off_cancels_timer_and_suppresses_retriggering() {
@@ -3233,6 +3894,68 @@ gap_dissolved = 2.0
         let s = state.lock().await;
         assert!(s.lights_off_at.is_none());
         assert!(s.suppressed_until.is_some());
+    }
+
+    // @lat: [[tests#Motion lighting automation#Non motion light off does not suppress automation]]
+    #[tokio::test]
+    async fn non_motion_light_off_does_not_suppress_automation() {
+        let state = test_automation_state();
+        let original_deadline = tokio::time::Instant::now() + OFF_DELAY;
+        {
+            let mut s = state.lock().await;
+            s.lights_off_at = Some(original_deadline);
+        }
+        let (cmd_tx, mut cmd_rx) = broadcast::channel(8);
+        let z2m_state = Arc::new(Mutex::new(std::collections::HashMap::new()));
+
+        handle_z2m_message(
+            r#"{"topic":"top_landing","payload":{"state":"OFF"}}"#,
+            &state,
+            &cmd_tx,
+            &z2m_state,
+        )
+        .await;
+
+        assert!(cmd_rx.try_recv().is_err());
+
+        let s = state.lock().await;
+        assert_eq!(s.lights_off_at, Some(original_deadline));
+        assert!(s.suppressed_until.is_none());
+        drop(s);
+
+        let zs = z2m_state.lock().await;
+        assert_eq!(zs.get("top_landing"), Some(&serde_json::json!({"state": "OFF"})));
+    }
+
+    // @lat: [[tests#Motion lighting automation#Motion light ON does not suppress automation]]
+    #[tokio::test]
+    async fn motion_light_on_does_not_suppress_automation() {
+        let state = test_automation_state();
+        let original_deadline = tokio::time::Instant::now() + OFF_DELAY;
+        {
+            let mut s = state.lock().await;
+            s.lights_off_at = Some(original_deadline);
+        }
+        let (cmd_tx, mut cmd_rx) = broadcast::channel(8);
+        let z2m_state = Arc::new(Mutex::new(std::collections::HashMap::new()));
+
+        handle_z2m_message(
+            r#"{"topic":"hall","payload":{"state":"ON"}}"#,
+            &state,
+            &cmd_tx,
+            &z2m_state,
+        )
+        .await;
+
+        assert!(cmd_rx.try_recv().is_err());
+
+        let s = state.lock().await;
+        assert_eq!(s.lights_off_at, Some(original_deadline));
+        assert!(s.suppressed_until.is_none());
+        drop(s);
+
+        let zs = z2m_state.lock().await;
+        assert_eq!(zs.get("hall"), Some(&serde_json::json!({"state": "ON"})));
     }
 
     // @lat: [[tests#Motion lighting automation#Active suppression blocks dark motion retriggering]]

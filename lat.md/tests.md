@@ -138,9 +138,29 @@ When either motion sensor fires while the shared timer is already active, the au
 
 A bright occupancy event must update cached illuminance while the timer is idle but avoid turning the motion lights on.
 
+### Occupancy false refreshes cached lux without switching lights
+
+A motion-sensor report with `occupancy = false` may still refresh cached illuminance while the timer is idle, but it must not arm the shared timer or switch the motion lights on.
+
+### Illuminance-only reports refresh lux without switching lights
+
+A motion-sensor payload that carries only illuminance must update the cached lux sample while the timer is idle, but it must not be treated as motion or arm the shared timer.
+
+### Active timer motion keeps the pre light lux sample
+
+While the shared timer is active, new motion reports must not overwrite the cached illuminance sample because that lux is contaminated by the automation's own light output.
+
 ### Manual off cancels the timer and suppresses retriggering
 
 When a motion-linked light reports `OFF` during an active timer, the automation must clear the timer and suppress fresh motion triggers for one timeout window.
+
+### Non motion light off does not suppress automation
+
+A dashboard-only light such as `top_landing` must not cancel the motion timer or create suppression when it reports `OFF`, because it is outside the motion-light automation set.
+
+### Motion light ON does not suppress automation
+
+A motion-linked light state report of `ON` must not cancel the shared timer or create suppression, because only an explicit `OFF` is treated as a manual override.
 
 ### Active suppression blocks dark motion retriggering
 
@@ -166,6 +186,10 @@ When the cached Zigbee state says a light is already on, the toggle handler must
 
 When no retained Zigbee state exists for a known light, the toggle handler must treat it as off and optimistically send ON.
 
+### Light toggle treats malformed cached state as OFF
+
+When a known light has cached payload data but no string `state` field equal to `ON`, the toggle handler must fail safe by treating that cache entry as off and sending ON.
+
 ### Unknown light commands fail without publishing Zigbee traffic
 
 Handlers for light control must reject names outside the configured light list and avoid sending any Zigbee command when they do.
@@ -177,6 +201,10 @@ For a configured light name, the explicit on and off handlers must publish exact
 ### Lights state reports missing cache entries as off
 
 The dashboard lights-state endpoint must include every configured light and mark ones without cached state as off rather than omitting them or treating them as on.
+
+### Lights state treats malformed cached state as off
+
+If a cached light payload is present but the `state` field is missing or not the string `ON`, the dashboard lights-state response must still report that light as off.
 
 ### Hot water endpoint returns the current DHW snapshot
 
@@ -208,25 +236,39 @@ When Zigbee2MQTT delivers a non-bridge topic without a slash, z2m-hub must cache
 
 Bridge topics and slash-containing topics such as command acknowledgements must not be inserted into the retained device-state cache because they are not dashboard device snapshots.
 
-## DHW write format
+### Retained slashless Zigbee topics overwrite older cached state
 
-These specs pin the line-protocol field set and type encoding as a golden reference so the PostgreSQL INSERT can be verified for field equivalence.
+When Zigbee2MQTT later replays or updates the same slashless device topic, z2m-hub must replace the cached payload so dashboard reads and toggle decisions use the latest state rather than stale retained data.
 
-### LP golden snapshot matches expected field layout
+## PostgreSQL interface
 
-The exact LP string from `test_state()` defaults must match a pinned golden value so the migration can map each LP field to its INSERT column.
+These specs cover the fail-safe PostgreSQL read/write contract outside the live database integration tests.
 
-### LP payload includes all eight fields with correct types
+### Query fallback returns zero defaults on transport failure
 
-The formatted line must contain all eight DHW fields with correct LP type encoding: floats, integer suffix, quoted string, and booleans.
+When the PostgreSQL transport has died after connect, `query_pg_f64` must return `(0.0, "")` rather than propagating an error or panicking. This preserves the safety-critical fallback contract used by the DHW model and dashboard handlers.
+
+### Reconnecting reader returns zero defaults when connect fails
+
+When `ReconnectingPg` cannot establish a PostgreSQL session at all, its read path must still return `(0.0, "")` so boot and dashboard reads fail safe before any connection exists.
+
+### Reconnecting writer ignores connect failures before a session exists
+
+When `ReconnectingPg` cannot establish a PostgreSQL session at all, its write path must log the connect error and return normally so the DHW loop keeps running.
+
+### Write row maps all dhw columns from state
+
+The pure row-mapping helper feeding `write_dhw_to_pg` must project every persisted `dhw` column from `DhwState` with the expected PostgreSQL types and values, including `model_version = 2`.
+
+This replaces the old line-protocol compatibility check with an idiomatic PostgreSQL-first contract on the actual insert payload shape.
 
 ### Bottom zone hot threshold at thirty degrees
 
-`bottom_zone_hot` must be `true` when `current_hwc > 30.0` and `false` at or below 30.0, preserving the inline business rule during migration.
+`bottom_zone_hot` must be `true` when `current_hwc > 30.0` and `false` at or below 30.0, preserving the write-path business rule used for the PostgreSQL boolean column.
 
-### LP encodes all charge states correctly
+### Charge state strings match dhw schema values
 
-Every `DhwChargeState` variant (`full`, `partial`, `standby`, `charging_below`, `charging_uniform`) must appear as a quoted string in the line protocol.
+Every `DhwChargeState` variant (`full`, `partial`, `standby`, `charging_below`, `charging_uniform`) must map to the exact string written into the PostgreSQL `charge_state` column.
 
 ### Write failure does not stop the caller
 
@@ -280,6 +322,30 @@ For fixed full_litres and remaining, a higher Multical register reading must alw
 
 For fixed full_litres and volume_now, higher remaining litres (less drawn) must produce a higher or equal volume_at_reset.
 
+### Startup recovery hydrates cached sensors and volume offset
+
+When startup reloads persisted litres plus live readings, it must repopulate the cached T1/Hwc values, effective top temperature, and reconstructed `volume_at_reset` in one step.
+
+### Startup recovery while charging captures the charge start baseline
+
+If the service restarts during an active charge, startup recovery must seed `t1_at_charge_start`, mark `was_charging`, and enter the `charging_below` state so crossover detection resumes correctly.
+
+## DHW loop orchestration
+
+These specs cover the small pure orchestration helper that applies one live DHW polling tick to in-memory state.
+
+### Charge end resets volume and requests a write
+
+When a live tick sees charging transition to idle, it must run charge completion, reset `volume_at_reset` to the current Multical register, clear any stale Hwc crash flag, and request persistence.
+
+### Draw start snapshots temperatures and clears prior crash state
+
+When draw flow crosses the active threshold, the live-tick helper must start draw tracking by snapshotting current T1/Hwc readings and clearing any prior crash flag.
+
+### Draw end clears drawing and requests a write
+
+When a draw was active on the previous tick but the current flow is below threshold, the live-tick helper must clear the drawing flag and request persistence of the updated state.
+
 ## Heating proxy
 
 These specs cover the thin JSON relay contract between z2m-hub and the separate heating-mvp service.
@@ -300,6 +366,10 @@ For the heating status read path, local JSON or transport errors must be wrapped
 
 The heating status wrapper must call the upstream `/status` endpoint with HTTP GET and relay the returned JSON unchanged.
 
+### Heating status invalid JSON keeps status error shape
+
+If the upstream status endpoint replies with malformed JSON, z2m-hub must return an `{ "error": ... }` object without adding `ok: false`, preserving the read-path error shape.
+
 ### Heating mode and kill call their upstream POST endpoints
 
 The heating mode wrapper must POST to `/mode/{mode}`, and the kill wrapper must POST to `/kill`, so dashboard actions hit the intended upstream control routes.
@@ -307,6 +377,10 @@ The heating mode wrapper must POST to `/mode/{mode}`, and the kill wrapper must 
 ### Heating away forwards request JSON body unchanged
 
 The heating away wrapper must POST to `/mode/away` and forward the dashboard JSON body unchanged so the upstream service receives the requested away window payload intact.
+
+### Heating mode invalid JSON keeps ok false error shape
+
+If a heating mode action gets a malformed upstream JSON body, z2m-hub must return `{ "ok": false, "error": ... }` so write-style actions keep their stable failure contract.
 
 ## Config loading
 
@@ -334,9 +408,17 @@ For Pi/Linux services, production uses systemd encrypted credentials; dev/test m
 
 When `$CREDENTIALS_DIRECTORY/pgpassword` exists, its content must be used as the password. This is the production path via `systemd-creds encrypt`.
 
+### Systemd credential takes precedence over PGPASSWORD
+
+When both the systemd credential file and `PGPASSWORD` exist, the credential file must win so production secrets are not silently shadowed by a shell environment.
+
 ### Connection string includes resolved password
 
 When a password is resolved from either supported source, `to_connection_string()` must include it as a `password=` parameter.
+
+### Blank systemd credential falls back to PGPASSWORD
+
+When the credential file is present but trims to empty content, password resolution must ignore it and fall back to `PGPASSWORD` rather than returning an unusable blank password.
 
 ### Connection string omits password when none resolved
 
@@ -351,6 +433,14 @@ These specs cover the fail-safe query/read contract outside the live database in
 ### Query fallback returns zero defaults on transport failure
 
 When the PostgreSQL transport has died after connect, `query_pg_f64` must return `(0.0, "")` rather than propagating an error or panicking. This preserves the safety-critical fallback contract used by the DHW model and dashboard handlers.
+
+### DHW polling helpers query the intended columns and windows
+
+The thin PostgreSQL polling helpers must select the intended `multical` columns and recency windows so DHW startup and live ticks read the correct sensor streams.
+
+### DHW polling helpers default to zero when PostgreSQL returns no row
+
+When PostgreSQL has no recent row for volume, T1, or flow, each polling helper must still return `0.0` via the shared query fallback contract.
 
 ## eBUS interface
 
@@ -367,6 +457,14 @@ The DHW status snapshot must still report charging when `HwcSFMode` is `load` ev
 ### Malformed Status01 falls back to zero return temperature
 
 If Status01 does not contain a parseable return-temperature field, the parsed return temperature must fall back to `0.0` rather than failing the handler.
+
+### Hwc storage helper parses numeric replies and defaults to zero
+
+The direct `HwcStorageTemp` helper must parse a numeric ebusd reply as `f64` and fall back to `0.0` when ebusd returns malformed text.
+
+### Charging helper treats either sfmode load or Status01 hwc as charging
+
+The direct charging helper must report charging when either `HwcSFMode` is `load` or `Status01` ends in `;hwc`, and report false only when both signals say idle.
 
 ## Real PostgreSQL integration
 
