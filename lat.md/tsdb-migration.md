@@ -35,13 +35,31 @@ Authoritative cross-repo tracker: `~/github/energy-hub/lat.md/tsdb-migration.md`
 
 Open actions that still affect migration completion:
 1. `heatpump-analysis`: finish its repo-local PostgreSQL migration, `adaptive-heating-mvp` cutover, and verification.
-2. `energy-hub`: move the remaining operator tooling (`ct-step-replay.py`, `ct-step-calibrate.py`, `ct-delta-profile.py`, and `tesla-octopus-regression.py`) off the legacy InfluxDB APIs and refresh its operator docs / verification evidence.
-3. pi5data Phase 5: retire Telegraf's `influxdb_v2` output.
-4. pi5data Phase 5: remove the Grafana v2 datasource.
-5. pi5data Phase 5: stop and remove the InfluxDB v2 container.
-6. pi5data Phase 5: archive the v2 data volume.
+2. pi5data Phase 5: retire Telegraf's `influxdb_v2` output.
+3. pi5data Phase 5: remove the Grafana v2 datasource.
+4. pi5data Phase 5: stop and remove the InfluxDB v2 container.
+5. pi5data Phase 5: archive the v2 data volume.
 
-z2m-hub has no remaining repo-local dependency on InfluxDB. The remaining work is shared-platform completion and final decommission.
+z2m-hub has no remaining repo-local runtime dependency on InfluxDB. The remaining migration blockers are shared-platform completion plus the last external consumer (`heatpump-analysis`).
+
+### Reviewed repo-local Influx-shaped artifacts
+
+The previous test-only line-protocol compatibility helper and its linked specs have now been removed.
+
+z2m-hub no longer keeps repo-local Influx-shaped test artifacts. The remaining repo-local persistence evidence is PostgreSQL-first:
+- `src/main.rs`: `dhw_write_row`
+- [[tests#PostgreSQL interface]]
+- [[tests#Real PostgreSQL integration]]
+
+This means the remaining migration blockers are fully outside this repo: shared-platform Phase 5 cleanup, the external rollback artifact on `pi5data`, and the last external consumer tracked in `energy-hub`.
+
+### Repo-local deletion candidates after Phase 5
+
+After the shared tracker closes and the rollback window is explicitly over, the remaining repo-local cleanup deletions should be:
+1. `pi5data`: remove `/usr/local/bin/z2m-hub.pre-pg-rollback.bak` after the final maintenance-window sign-off.
+2. `lat.md/tsdb-migration.md`: retire this file or reduce it to a short backlink once Phase 5 is complete and no closure notes still need to live here.
+
+Not deletion candidates: the PostgreSQL write-mapping tests, PostgreSQL write-failure tests, autoload bounds tests, startup reconstruction tests, and the live-PG verification specs. Those still describe the current PostgreSQL contract and restart-safety behaviour.
 
 ## Historical read-parity note
 

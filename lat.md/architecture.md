@@ -34,7 +34,7 @@ The DHW loop now keeps more of its state transitions in small pure helpers such 
 
 Some interface glue also uses small pure helpers for deterministic parsing and response shaping, such as heating-proxy JSON wrapping, so the LAN client shells remain thin and auditable without introducing subprocesses or duplicate policy logic.
 
-The PostgreSQL persistence layer also follows this pattern: `ReconnectingPg` is the thin runtime seam that connects on demand, [[src/main.rs#query_pg_f64]] handles all read queries with zero-default fallback, [[src/main.rs#write_dhw_to_pg]] handles fire-and-forget writes, [[src/main.rs#apply_autoload]] decides startup capacity upgrades, and [[src/main.rs#reconstruct_volume_at_reset]] recovers volume-register state on restart.
+The PostgreSQL persistence layer also follows this pattern: `ReconnectingPg` is the thin runtime seam that connects on demand, [[src/main.rs#query_pg_f64]] handles all read queries with zero-default fallback, `dhw_write_row` is the pure helper that maps `DhwState` into the `dhw` insert payload, [[src/main.rs#write_dhw_to_pg]] handles fire-and-forget writes, [[src/main.rs#apply_autoload]] decides startup capacity upgrades, [[src/main.rs#reconstruct_volume_at_reset]] recovers volume-register state on restart, `apply_startup_recovery` hydrates `DhwState` from persisted litres plus live startup readings before the polling loop begins, and `apply_live_dhw_tick` owns the per-tick charge/draw transition policy while the async loop stays responsible for sensor polling and PostgreSQL side effects.
 
 The design assumes low enough contention that coarse mutexes are acceptable.
 
