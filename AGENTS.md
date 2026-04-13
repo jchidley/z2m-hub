@@ -21,11 +21,11 @@ Use these `lat.md/` files as the canonical source of truth for current behaviour
 - `lat.md/architecture.md` — runtime structure and shared-state model
 - `lat.md/automations.md` — motion-light rules and manual override behaviour
 - `lat.md/dhw.md` — DHW tracking model and invariants
-- `lat.md/interfaces.md` — HTTP, Z2M, eBUS, InfluxDB, heating proxy contracts
+- `lat.md/interfaces.md` — HTTP, Z2M, eBUS, PostgreSQL, heating proxy contracts
 - `lat.md/infrastructure.md` — hosts, config ownership, deployment shape
 - `lat.md/constraints.md` — hard operational boundaries
 
-Use `docs/code-truth/` for code-derived navigation and `README.md` for human-facing signposting.
+Use `README.md` for human-facing signposting.
 
 ## Commands
 

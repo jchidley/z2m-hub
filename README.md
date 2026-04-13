@@ -34,7 +34,6 @@ open http://10.0.1.230:3030
   - [External interfaces](lat.md/interfaces.md)
   - [Deployment and configuration](lat.md/infrastructure.md)
   - [Operational constraints](lat.md/constraints.md)
-- [`docs/code-truth/`](docs/code-truth/) — code-derived navigation and architectural notes
 - [`AGENTS.md`](AGENTS.md) — agent workflow, commands, and repo-specific execution rules
 
 When docs and code disagree, code wins. When multiple docs could carry the same current-state fact, prefer `lat.md/` as the authoritative home.

@@ -13,7 +13,7 @@ This graph is the source of truth for current architecture, domain rules, and li
 - [[infrastructure]] records hosts, config ownership, and deployment shape.
 - [[constraints]] captures hard boundaries that should guide code changes.
 - [[tests]] records durable test specs and `@lat:` traceability anchors for high-value invariants.
-- [[tsdb-migration]] tracks the repo-local PostgreSQL/TimescaleDB migration plan aligned with the shared energy-hub cutover.
+- [[tsdb-migration]] records the remaining shared completion work and repo-local closeout evidence for the InfluxDB-to-PostgreSQL migration.
 
 ## Reading order
 
@@ -26,5 +26,4 @@ For most work, read [[architecture#Runtime structure]], then one of [[automation
 Human-facing narrative stays outside this graph so each fact has one obvious home.
 
 - `README.md` is for signposting, build/deploy basics, and project framing.
-- `docs/code-truth/` is for code-derived maps and decisions.
 - `AGENTS.md` is for agent workflow, commands, and short operational gotchas.
