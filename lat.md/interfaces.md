@@ -4,7 +4,7 @@ This file defines the external protocols and endpoint contracts that z2m-hub dep
 
 ## External interfaces
 
-z2m-hub is defined by a small set of LAN protocols: HTTP for the dashboard, WebSocket for Zigbee, raw TCP for eBUS, and HTTP for InfluxDB.
+z2m-hub is defined by a small set of LAN protocols: HTTP for the dashboard, WebSocket for Zigbee, raw TCP for eBUS, and PostgreSQL wire protocol for TimescaleDB.
 
 ## HTTP API
 
@@ -33,11 +33,13 @@ Heat-pump control uses one TCP connection per command to ebusd on `localhost:888
 
 The server writes `command + "\n"`, shuts down the write side, and reads until EOF. The code assumes ebusd remains line-based and request/response oriented. Commands used today include `read -f -c 700 HwcSFMode`, `read -f -c hmu Status01`, `read -f -c 700 HwcStorageTemp`, and `write -c 700 HwcSFMode load`.
 
-## InfluxDB read and write contract
+## PostgreSQL read and write contract
 
-InfluxDB is both the source of DHW telemetry and the persistence layer for the current estimate.
+TimescaleDB on `10.0.1.230:5432` is both the source of DHW telemetry and the persistence layer for the current estimate.
 
-The service sends Flux queries to `http://localhost:8086/api/v2/query`, parses CSV looking for `_value` and `_time`, and writes line protocol back to the `energy` bucket. The code depends on the current column naming and on the Multical volume register staying monotonic.
+The service queries `multical`, `dhw`, and `dhw_capacity` tables via `tokio-postgres`, using `ORDER BY time DESC LIMIT 1` for last-value semantics. Reads return `(f64, String)` with a `(0.0, "")` zero-default on any error. Writes INSERT into the `dhw` table with an explicit `now()` timestamp. The runtime PostgreSQL seam connects on demand per read/write operation rather than holding one long-lived shared client, so startup does not fail just because TimescaleDB is briefly unavailable and later calls naturally retry after a disconnect. The code depends on the shared TimescaleDB schema column naming and on the Multical volume register staying monotonic.
+
+**TimescaleDB hypertable constraint:** the `dhw` table is a hypertable partitioned by `time`. TimescaleDB does not support unique constraints on the partitioning column alone, so `ON CONFLICT (time)` is not available. The write path uses plain INSERT — duplicate timestamps are impossible in practice because `now()` is evaluated server-side for each single-writer call.
 
 ## Heating MVP proxy
 

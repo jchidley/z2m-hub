@@ -9,11 +9,11 @@ This graph is the source of truth for current architecture, domain rules, and li
 - [[architecture]] explains the runtime shape and shared-state model.
 - [[automations]] captures motion-light behaviour and override rules.
 - [[dhw]] explains the remaining-hot-water model.
-- [[interfaces]] defines HTTP, WebSocket, eBUS, InfluxDB, and heating proxy contracts.
+- [[interfaces]] defines HTTP, WebSocket, eBUS, PostgreSQL, and heating proxy contracts.
 - [[infrastructure]] records hosts, config ownership, and deployment shape.
 - [[constraints]] captures hard boundaries that should guide code changes.
 - [[tests]] records durable test specs and `@lat:` traceability anchors for high-value invariants.
-- [[postgres-migration]] tracks the repo-local PostgreSQL/TimescaleDB migration plan aligned with the shared energy-hub cutover.
+- [[tsdb-migration]] tracks the repo-local PostgreSQL/TimescaleDB migration plan aligned with the shared energy-hub cutover.
 
 ## Reading order
 

@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use axum::extract::State;
 use axum::response::Html;
 use axum::routing::get;
@@ -30,20 +31,159 @@ struct DhwConfig {
     gap_sharp: f64,
     /// Gap threshold for dissolved thermocline (°C)
     gap_dissolved: f64,
-    /// Minimum sane full_litres from InfluxDB autoload
+    /// Minimum sane full_litres from database autoload
     #[serde(default = "default_full_litres_min")]
     full_litres_min: f64,
-    /// Maximum sane full_litres from InfluxDB autoload
+    /// Maximum sane full_litres from database autoload
     #[serde(default = "default_full_litres_max")]
     full_litres_max: f64,
 }
 
-fn default_full_litres_min() -> f64 { 160.0 }
-fn default_full_litres_max() -> f64 { 220.0 }
+fn default_full_litres_min() -> f64 {
+    160.0
+}
+fn default_full_litres_max() -> f64 {
+    220.0
+}
+
+fn default_db_host() -> String {
+    "10.0.1.230".to_string()
+}
+fn default_db_port() -> u16 {
+    5432
+}
+fn default_db_dbname() -> String {
+    "energy".to_string()
+}
+fn default_db_user() -> String {
+    "energy".to_string()
+}
+
+/// PostgreSQL/TimescaleDB connection configuration
+#[derive(Debug, Clone, Deserialize)]
+struct DatabaseConfig {
+    #[serde(default = "default_db_host")]
+    host: String,
+    #[serde(default = "default_db_port")]
+    port: u16,
+    #[serde(default = "default_db_dbname")]
+    dbname: String,
+    #[serde(default = "default_db_user")]
+    user: String,
+}
+
+/// Name of the systemd credential containing the PostgreSQL password.
+/// Provisioned via `systemd-creds encrypt` and loaded by `LoadCredentialEncrypted=`
+/// in the systemd unit file.
+const PG_CREDENTIAL_NAME: &str = "pgpassword";
+
+#[async_trait]
+trait PgAccess: Send + Sync {
+    async fn query_f64(&self, query: &str) -> (f64, String);
+    async fn write_dhw(&self, s: &DhwState);
+}
+
+#[derive(Debug)]
+struct ReconnectingPg {
+    config: DatabaseConfig,
+}
+
+impl ReconnectingPg {
+    fn new(config: DatabaseConfig) -> Self {
+        Self { config }
+    }
+
+    async fn connect(&self) -> Result<tokio_postgres::Client, tokio_postgres::Error> {
+        let conn_str = self.config.to_connection_string();
+        let (client, connection) =
+            tokio_postgres::connect(&conn_str, tokio_postgres::NoTls).await?;
+        let host = self.config.host.clone();
+        let port = self.config.port;
+        tokio::spawn(async move {
+            if let Err(e) = connection.await {
+                error!("PostgreSQL connection error at {host}:{port}: {e}");
+            }
+        });
+        Ok(client)
+    }
+}
+
+#[async_trait]
+impl PgAccess for ReconnectingPg {
+    async fn query_f64(&self, query: &str) -> (f64, String) {
+        match self.connect().await {
+            Ok(client) => query_pg_f64(&client, query, &[]).await,
+            Err(e) => {
+                error!(
+                    "PostgreSQL connect error at {}:{}: {e}",
+                    self.config.host, self.config.port
+                );
+                (0.0, String::new())
+            }
+        }
+    }
+
+    async fn write_dhw(&self, s: &DhwState) {
+        match self.connect().await {
+            Ok(client) => write_dhw_to_pg(&client, s).await,
+            Err(e) => error!(
+                "PostgreSQL connect error at {}:{}: {e}",
+                self.config.host, self.config.port
+            ),
+        }
+    }
+}
+
+impl DatabaseConfig {
+    /// Resolve the password in priority order:
+    /// 1. systemd credential ($CREDENTIALS_DIRECTORY/pgpassword) — encrypted at rest
+    /// 2. PGPASSWORD env var — for dev and CI
+    ///
+    /// No plaintext password fields exist in the config struct — secrets must
+    /// not live in TOML files that could be committed or left world-readable.
+    fn resolve_password(&self) -> Option<String> {
+        // 1. systemd credential (encrypted at rest via systemd-creds)
+        if let Ok(creds_dir) = std::env::var("CREDENTIALS_DIRECTORY") {
+            let path = format!("{creds_dir}/{PG_CREDENTIAL_NAME}");
+            if let Ok(pw) = std::fs::read_to_string(&path) {
+                let pw = pw.trim().to_string();
+                if !pw.is_empty() {
+                    return Some(pw);
+                }
+            }
+        }
+        // 2. PGPASSWORD env var
+        std::env::var("PGPASSWORD").ok()
+    }
+
+    fn to_connection_string(&self) -> String {
+        let mut s = format!(
+            "host={} port={} dbname={} user={}",
+            self.host, self.port, self.dbname, self.user
+        );
+        if let Some(pw) = self.resolve_password() {
+            s.push_str(&format!(" password={pw}"));
+        }
+        s
+    }
+}
+
+impl Default for DatabaseConfig {
+    fn default() -> Self {
+        Self {
+            host: default_db_host(),
+            port: default_db_port(),
+            dbname: default_db_dbname(),
+            user: default_db_user(),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Deserialize)]
 struct HubConfig {
     dhw: DhwConfig,
+    #[serde(default)]
+    database: DatabaseConfig,
 }
 
 impl HubConfig {
@@ -84,6 +224,7 @@ impl HubConfig {
                 full_litres_min: 160.0,
                 full_litres_max: 220.0,
             },
+            database: DatabaseConfig::default(),
         }
     }
 }
@@ -137,7 +278,7 @@ impl std::fmt::Display for DhwChargeState {
 
 /// DHW tracking state — physics-based model per dhw-cylinder-analysis.md
 struct DhwState {
-    /// Runtime full capacity (config value, possibly upgraded by InfluxDB autoload)
+    /// Runtime full capacity (config value, possibly upgraded by database autoload)
     full_litres: f64,
     /// Current remaining usable litres
     remaining: f64,
@@ -183,10 +324,10 @@ struct DhwState {
 #[derive(Clone)]
 struct AppState {
     http_client: reqwest::Client,
+    pg: Arc<dyn PgAccess>,
     cmd_tx: broadcast::Sender<Z2mMessage>,
     z2m_state: Arc<Mutex<std::collections::HashMap<String, serde_json::Value>>>,
     dhw_state: Arc<Mutex<DhwState>>,
-    config: Arc<HubConfig>,
 }
 
 const Z2M_WS_URL: &str = "ws://emonpi:8080/api";
@@ -195,12 +336,6 @@ const MOTION_LIGHTS: &[&str] = &["landing", "hall"];
 const OFF_DELAY: Duration = Duration::from_secs(300);
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 const HTTP_PORT: u16 = 3030;
-
-const INFLUXDB_URL: &str = "http://localhost:8086";
-const INFLUXDB_TOKEN: &str =
-    "jPTPrwcprKfDzt8IFr7gkn6shpBy15j8hFeyjLaBIaJ0IwcgQeXJ4LtrvVBJ5aIPYuzEfeDw5e-cmtAuvZ-Xmw==";
-const INFLUXDB_ORG: &str = "home";
-
 
 /// Motion sensor config: (name, illuminance threshold)
 const MOTION_SENSORS: &[(&str, f64)] = &[("landing_motion", 15.0), ("hall_motion", 15.0)];
@@ -233,6 +368,12 @@ async fn main() {
     let config = Arc::new(HubConfig::load(CONFIG_PATH));
     info!("DHW config: full_litres={}", config.dhw.full_litres);
 
+    let pg: Arc<dyn PgAccess> = Arc::new(ReconnectingPg::new(config.database.clone()));
+    info!(
+        "Configured PostgreSQL target at {}:{} (connect on demand)",
+        config.database.host, config.database.port
+    );
+
     let dhw_state = Arc::new(Mutex::new(DhwState {
         full_litres: config.dhw.full_litres,
         remaining: 0.0,
@@ -255,16 +396,16 @@ async fn main() {
 
     let app_state = AppState {
         http_client: reqwest::Client::new(),
+        pg: pg.clone(),
         cmd_tx: cmd_tx.clone(),
         z2m_state: z2m_state.clone(),
         dhw_state: dhw_state.clone(),
-        config: config.clone(),
     };
 
     let timer_state = automation_state.clone();
     let timer_cmd_tx = cmd_tx.clone();
 
-    let dhw_client = app_state.http_client.clone();
+    let dhw_pg = pg.clone();
     let dhw_state_loop = dhw_state.clone();
 
     // Build axum router
@@ -296,7 +437,7 @@ async fn main() {
         _ = z2m_connection_loop(automation_state, cmd_tx, z2m_state) => {
             error!("Z2M connection loop exited unexpectedly");
         }
-        _ = dhw_tracking_loop(dhw_state_loop, dhw_client, config.clone()) => {
+        _ = dhw_tracking_loop(dhw_state_loop, dhw_pg, config.clone()) => {
             error!("DHW tracking loop exited unexpectedly");
         }
         result = async {
@@ -325,55 +466,32 @@ async fn api_hot_water(State(state): State<AppState>) -> Json<serde_json::Value>
     }))
 }
 
-fn parse_influx_query_csv(body: &str) -> (f64, String) {
-    // Parse CSV response — find the last row with _value
-    let mut litres = 0.0;
-    let mut timestamp = String::new();
-
-    let mut headers: Vec<String> = Vec::new();
-    for line in body.lines() {
-        if line.starts_with('#') || line.is_empty() {
-            continue;
+/// Query PostgreSQL for a single f64 value. Returns `(0.0, "")` on any error
+/// or empty result — preserving the safety-critical zero-default fallback
+/// contract so the DHW model starts from zeros and recovers naturally.
+async fn query_pg_f64<C>(
+    pg: &C,
+    query: &str,
+    params: &[&(dyn tokio_postgres::types::ToSql + Sync)],
+) -> (f64, String)
+where
+    C: tokio_postgres::GenericClient + Sync,
+{
+    match pg.query_opt(query, params).await {
+        Ok(Some(row)) => {
+            let value: f64 = row.try_get(0).unwrap_or(0.0);
+            let timestamp: String = row
+                .try_get::<_, chrono::DateTime<chrono::Utc>>(1)
+                .map(|t| t.to_rfc3339())
+                .unwrap_or_default();
+            (value, timestamp)
         }
-        let fields: Vec<&str> = line.split(',').collect();
-        if headers.is_empty() {
-            headers = fields.iter().map(|s| s.to_string()).collect();
-            continue;
-        }
-        // Find column indices
-        if let (Some(val_idx), Some(time_idx)) = (
-            headers.iter().position(|h| h == "_value"),
-            headers.iter().position(|h| h == "_time"),
-        ) {
-            if let Some(val_str) = fields.get(val_idx) {
-                if let Ok(val) = val_str.parse::<f64>() {
-                    litres = val;
-                }
-            }
-            if let Some(ts) = fields.get(time_idx) {
-                timestamp = ts.to_string();
-            }
+        Ok(None) => (0.0, String::new()),
+        Err(e) => {
+            error!("PostgreSQL query error: {e}");
+            (0.0, String::new())
         }
     }
-
-    (litres, timestamp)
-}
-
-async fn query_influxdb(
-    client: &reqwest::Client,
-    query: &str,
-) -> Result<(f64, String), Box<dyn std::error::Error + Send + Sync>> {
-    let resp = client
-        .post(format!("{INFLUXDB_URL}/api/v2/query?org={INFLUXDB_ORG}"))
-        .header("Authorization", format!("Token {INFLUXDB_TOKEN}"))
-        .header("Content-Type", "application/vnd.flux")
-        .header("Accept", "application/csv")
-        .body(query.to_string())
-        .send()
-        .await?;
-
-    let body = resp.text().await?;
-    Ok(parse_influx_query_csv(&body))
 }
 
 async fn api_light_on(
@@ -473,7 +591,7 @@ fn parse_status01(status: &str, sfmode: &str) -> (bool, f64) {
     (charging, return_temp)
 }
 
-async fn api_dhw_boost(State(state): State<AppState>) -> Json<serde_json::Value> {
+async fn api_dhw_boost(State(_state): State<AppState>) -> Json<serde_json::Value> {
     // HwcSFMode "load" = one-shot cylinder charge, reverts to auto when done
     match ebusd_command("write -c 700 HwcSFMode load").await {
         Ok(resp) if resp == "done" => {
@@ -505,15 +623,16 @@ async fn api_dhw_status(State(state): State<AppState>) -> Json<serde_json::Value
         .parse()
         .unwrap_or(0.0);
 
-    // T1 (hot out) from emondhw Multical via InfluxDB
-    let t1_query = r#"from(bucket: "energy")
-  |> range(start: -1h)
-  |> filter(fn: (r) => r._measurement == "emon" and r._field == "value" and r.field == "dhw_t1")
-  |> last()"#;
-    let t1 = query_influxdb(&state.http_client, t1_query)
+    // T1 (hot out) from emondhw Multical via PostgreSQL
+    let t1 = state
+        .pg
+        .query_f64(
+            "SELECT dhw_t1, time FROM multical \
+             WHERE time >= now() - interval '1 hour' \
+             ORDER BY time DESC LIMIT 1",
+        )
         .await
-        .map(|(v, _)| v)
-        .unwrap_or(0.0);
+        .0;
 
     // HwcStorageTemp — VR 10 NTC in cylinder dry pocket, above bottom coil
     let cylinder_temp: f64 = ebusd_command("read -f -c 700 HwcStorageTemp")
@@ -1011,37 +1130,34 @@ async fn api_heating_kill(State(state): State<AppState>) -> Json<serde_json::Val
 
 // ── DHW tracking loop (physics-based model) ────────────────────────────────
 
-async fn get_current_volume(client: &reqwest::Client) -> f64 {
-    let query = r#"from(bucket: "energy")
-  |> range(start: -1h)
-  |> filter(fn: (r) => r._measurement == "emon" and r._field == "value" and r.field == "dhw_volume_V1")
-  |> last()"#;
-    query_influxdb(client, query)
-        .await
-        .map(|(v, _)| v)
-        .unwrap_or(0.0)
+async fn get_current_volume(pg: &dyn PgAccess) -> f64 {
+    pg.query_f64(
+        "SELECT dhw_volume_v1, time FROM multical \
+         WHERE time >= now() - interval '1 hour' \
+         ORDER BY time DESC LIMIT 1",
+    )
+    .await
+    .0
 }
 
-async fn get_current_t1(client: &reqwest::Client) -> f64 {
-    let query = r#"from(bucket: "energy")
-  |> range(start: -1h)
-  |> filter(fn: (r) => r._measurement == "emon" and r._field == "value" and r.field == "dhw_t1")
-  |> last()"#;
-    query_influxdb(client, query)
-        .await
-        .map(|(v, _)| v)
-        .unwrap_or(0.0)
+async fn get_current_t1(pg: &dyn PgAccess) -> f64 {
+    pg.query_f64(
+        "SELECT dhw_t1, time FROM multical \
+         WHERE time >= now() - interval '1 hour' \
+         ORDER BY time DESC LIMIT 1",
+    )
+    .await
+    .0
 }
 
-async fn get_current_dhw_flow(client: &reqwest::Client) -> f64 {
-    let query = r#"from(bucket: "energy")
-  |> range(start: -5m)
-  |> filter(fn: (r) => r._measurement == "emon" and r._field == "value" and r.field == "dhw_flow")
-  |> last()"#;
-    query_influxdb(client, query)
-        .await
-        .map(|(v, _)| v)
-        .unwrap_or(0.0)
+async fn get_current_dhw_flow(pg: &dyn PgAccess) -> f64 {
+    pg.query_f64(
+        "SELECT dhw_flow, time FROM multical \
+         WHERE time >= now() - interval '5 minutes' \
+         ORDER BY time DESC LIMIT 1",
+    )
+    .await
+    .0
 }
 
 async fn get_hwc_storage_temp() -> f64 {
@@ -1064,8 +1180,9 @@ async fn is_charging() -> bool {
 
 /// Build the InfluxDB line-protocol payload for the current DHW state.
 ///
-/// Pure function so the field set and type encoding can be tested
-/// independently of the HTTP transport.
+/// Retained as a golden-reference formatter so pre-migration regression tests
+/// can verify LP-to-INSERT field equivalence.
+#[cfg(test)]
 fn format_dhw_line_protocol(s: &DhwState) -> String {
     format!(
         "dhw remaining_litres={:.1},model_version=2i,t1={:.2},hwc_storage={:.2},\
@@ -1081,21 +1198,32 @@ fn format_dhw_line_protocol(s: &DhwState) -> String {
     )
 }
 
-async fn write_dhw_to_influxdb(client: &reqwest::Client, s: &DhwState) {
-    let line = format_dhw_line_protocol(s);
-    let result = client
-        .post(format!(
-            "{INFLUXDB_URL}/api/v2/write?org={INFLUXDB_ORG}&bucket=energy&precision=s"
-        ))
-        .header("Authorization", format!("Token {INFLUXDB_TOKEN}"))
-        .header("Content-Type", "text/plain")
-        .body(line)
-        .send()
+/// Write current DHW state to PostgreSQL. Fire-and-forget: logs errors but
+/// never propagates them — a flaky database must not stop the DHW automation loop.
+async fn write_dhw_to_pg<C>(pg: &C, s: &DhwState)
+where
+    C: tokio_postgres::GenericClient + Sync,
+{
+    let result = pg
+        .execute(
+            "INSERT INTO dhw (time, remaining_litres, model_version, t1, hwc_storage, \
+             effective_t1, charge_state, crossover, bottom_zone_hot) \
+             VALUES (now(), $1, $2, $3, $4, $5, $6, $7, $8)",
+            &[
+                &s.remaining,
+                &2i32,
+                &s.current_t1,
+                &s.current_hwc,
+                &s.effective_t1,
+                &s.charge_state.to_string(),
+                &s.crossover_achieved,
+                &(s.current_hwc > 30.0),
+            ],
+        )
         .await;
     match result {
-        Ok(resp) if resp.status().is_success() => {}
-        Ok(resp) => error!("InfluxDB write failed: {}", resp.status()),
-        Err(e) => error!("InfluxDB write error: {e}"),
+        Ok(_) => {}
+        Err(e) => error!("PostgreSQL write error: {e}"),
     }
 }
 
@@ -1129,15 +1257,16 @@ fn apply_standby_decay(s: &mut DhwState, cfg: &DhwConfig) {
 fn apply_no_crossover_charge(s: &mut DhwState, cfg: &DhwConfig, t1_now: f64, hwc_now: f64) {
     let gap = t1_now - hwc_now;
     let full = s.full_litres;
-    info!(
-        "DHW no-crossover charge ended: T1={t1_now:.1}, HwcS={hwc_now:.1}, gap={gap:.1}"
-    );
+    info!("DHW no-crossover charge ended: T1={t1_now:.1}, HwcS={hwc_now:.1}, gap={gap:.1}");
 
     if gap < cfg.gap_dissolved {
         // Thermocline dissolved — effectively full but at a lower temperature
         s.remaining = full;
         s.charge_state = DhwChargeState::Full;
-        info!("  Gap <{:.1}°C → thermocline dissolved, full at lower temp", cfg.gap_dissolved);
+        info!(
+            "  Gap <{:.1}°C → thermocline dissolved, full at lower temp",
+            cfg.gap_dissolved
+        );
     } else if gap > cfg.gap_sharp {
         // Sharp thermocline — remaining unchanged from before charge
         s.charge_state = DhwChargeState::Partial;
@@ -1151,9 +1280,7 @@ fn apply_no_crossover_charge(s: &mut DhwState, cfg: &DhwConfig, t1_now: f64, hwc
         let interpolated = s.remaining + frac * (full - s.remaining);
         s.remaining = interpolated;
         s.charge_state = DhwChargeState::Partial;
-        info!(
-            "  Gap {gap:.1}°C → interpolated frac={frac:.2}, remaining={interpolated:.0}L"
-        );
+        info!("  Gap {gap:.1}°C → interpolated frac={frac:.2}, remaining={interpolated:.0}L");
     }
 }
 
@@ -1246,20 +1373,28 @@ fn reconstruct_volume_at_reset(full_litres: f64, remaining: f64, volume_now: f64
 
 async fn dhw_tracking_loop(
     state: Arc<Mutex<DhwState>>,
-    client: reqwest::Client,
+    pg: Arc<dyn PgAccess>,
     config: Arc<HubConfig>,
 ) {
     let cfg = &config.dhw;
 
-    // Autoload recommended capacity from InfluxDB (written by dhw-inflection-detector.py)
+    // Autoload recommended capacity from database (written by dhw-inflection-detector.py)
     {
-        let query = r#"from(bucket: "energy")
-  |> range(start: -90d)
-  |> filter(fn: (r) => r._measurement == "dhw_capacity" and r._field == "recommended_full_litres")
-  |> last()"#;
-        if let Ok((recommended, _)) = query_influxdb(&client, query).await {
+        let (recommended, _) = pg
+            .query_f64(
+                "SELECT recommended_full_litres, time FROM dhw_capacity \
+                 WHERE time >= now() - interval '90 days' \
+                 ORDER BY time DESC LIMIT 1",
+            )
+            .await;
+        if recommended > 0.0 {
             let mut s = state.lock().await;
-            if let Some(new_full) = apply_autoload(s.full_litres, recommended, cfg.full_litres_min, cfg.full_litres_max) {
+            if let Some(new_full) = apply_autoload(
+                s.full_litres,
+                recommended,
+                cfg.full_litres_min,
+                cfg.full_litres_max,
+            ) {
                 let prev = s.full_litres;
                 s.full_litres = new_full;
                 info!(
@@ -1267,7 +1402,7 @@ async fn dhw_tracking_loop(
                      config={prev:.0}L → using {:.0}L",
                     s.full_litres
                 );
-            } else if recommended > 0.0 {
+            } else {
                 warn!(
                     "DHW autoload: recommended={recommended:.0}L outside sane range \
                      [{:.0}, {:.0}], ignoring",
@@ -1277,19 +1412,18 @@ async fn dhw_tracking_loop(
         }
     }
 
-    // Initialise remaining from InfluxDB
+    // Initialise remaining from database
     {
-        let query = r#"from(bucket: "energy")
-  |> range(start: -24h)
-  |> filter(fn: (r) => r._measurement == "dhw" and r._field == "remaining_litres")
-  |> last()"#;
-        let remaining = query_influxdb(&client, query)
-            .await
-            .map(|(v, _)| v)
-            .unwrap_or(0.0);
-        let volume = get_current_volume(&client).await;
+        let (remaining, _) = pg
+            .query_f64(
+                "SELECT remaining_litres, time FROM dhw \
+                 WHERE time >= now() - interval '24 hours' \
+                 ORDER BY time DESC LIMIT 1",
+            )
+            .await;
+        let volume = get_current_volume(pg.as_ref()).await;
         let charging = is_charging().await;
-        let t1 = get_current_t1(&client).await;
+        let t1 = get_current_t1(pg.as_ref()).await;
         let hwc = get_hwc_storage_temp().await;
 
         let mut s = state.lock().await;
@@ -1318,10 +1452,10 @@ async fn dhw_tracking_loop(
 
         // Read all sensors
         let charging = is_charging().await;
-        let volume_now = get_current_volume(&client).await;
-        let t1_now = get_current_t1(&client).await;
+        let volume_now = get_current_volume(pg.as_ref()).await;
+        let t1_now = get_current_t1(pg.as_ref()).await;
         let hwc_now = get_hwc_storage_temp().await;
-        let dhw_flow = get_current_dhw_flow(&client).await;
+        let dhw_flow = get_current_dhw_flow(pg.as_ref()).await;
 
         let mut s = state.lock().await;
 
@@ -1359,7 +1493,7 @@ async fn dhw_tracking_loop(
             apply_charge_completion(&mut s, cfg, t1_now, hwc_now);
             s.volume_at_reset = volume_now;
             s.hwc_crash_detected = false;
-            write_dhw_to_influxdb(&client, &s).await;
+            pg.write_dhw(&s).await;
         }
 
         // ── Draw detection and tracking ─────────────────────────────────
@@ -1379,7 +1513,7 @@ async fn dhw_tracking_loop(
 
         if volume_now > s.volume_at_reset {
             apply_draw_tracking(&mut s, cfg, volume_now, t1_now, hwc_now);
-            write_dhw_to_influxdb(&client, &s).await;
+            pg.write_dhw(&s).await;
         }
 
         if s.drawing && !is_drawing {
@@ -1389,7 +1523,7 @@ async fn dhw_tracking_loop(
                 "DHW draw ended: remaining={:.0}L, T1={t1_now:.1}, HwcS={hwc_now:.1}",
                 s.remaining
             );
-            write_dhw_to_influxdb(&client, &s).await;
+            pg.write_dhw(&s).await;
         }
 
         // ── Standby decay ───────────────────────────────────────────────
@@ -1589,7 +1723,10 @@ async fn handle_z2m_message(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{sync::OnceLock, time::{Duration, Instant}};
+    use std::{
+        sync::{Mutex as StdMutex, OnceLock},
+        time::{Duration, Instant},
+    };
 
     /// Build a DhwConfig with the production defaults (matching HubConfig::default)
     fn test_cfg() -> DhwConfig {
@@ -1638,15 +1775,103 @@ mod tests {
         }))
     }
 
-    fn test_app_state() -> AppState {
+    fn env_lock() -> &'static StdMutex<()> {
+        static ENV_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+        ENV_LOCK.get_or_init(|| StdMutex::new(()))
+    }
+
+    fn with_env_var_removed<T>(name: &str, f: impl FnOnce() -> T) -> T {
+        let _guard = env_lock().lock().expect("lock env guard");
+        let original = std::env::var(name).ok();
+        std::env::remove_var(name);
+        let result = f();
+        match original {
+            Some(value) => std::env::set_var(name, value),
+            None => std::env::remove_var(name),
+        }
+        result
+    }
+
+    /// Create a PG client whose connection task is immediately dropped.
+    /// Every query will fail — perfect for testing zero-default fallback
+    /// and fire-and-forget write contracts.
+    async fn dead_pg_client() -> Arc<tokio_postgres::Client> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port for PG mock");
+        let addr = listener.local_addr().expect("get local addr");
+        // Spawn a minimal PG handshake acceptor so connect() succeeds
+        let accept_handle = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut stream, _) = listener.accept().await.expect("accept PG connection");
+            // Read the startup message
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf).await;
+            // Send AuthenticationOk + ReadyForQuery
+            let auth_ok: &[u8] = &[b'R', 0, 0, 0, 8, 0, 0, 0, 0]; // AuthenticationOk
+            let ready: &[u8] = &[b'Z', 0, 0, 0, 5, b'I']; // ReadyForQuery(Idle)
+            stream.write_all(auth_ok).await.expect("send auth ok");
+            stream.write_all(ready).await.expect("send ready");
+            // Drop immediately — connection dies, all future queries fail
+            drop(stream);
+        });
+        let (client, connection) = tokio_postgres::connect(
+            &format!("host=127.0.0.1 port={} user=test dbname=test", addr.port()),
+            tokio_postgres::NoTls,
+        )
+        .await
+        .expect("connect to mock PG");
+        // Spawn connection but it will die when the mock drops
+        tokio::spawn(connection);
+        // Wait for the mock acceptor to finish
+        let _ = accept_handle.await;
+        // Small delay so the connection task notices the drop
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        Arc::new(client)
+    }
+
+    #[derive(Default)]
+    struct FakePg {
+        query_results: StdMutex<std::collections::HashMap<String, (f64, String)>>,
+    }
+
+    impl FakePg {
+        fn with_query_result(self, query: &str, value: f64, timestamp: &str) -> Self {
+            self.query_results
+                .lock()
+                .expect("fake pg query results mutex")
+                .insert(query.to_string(), (value, timestamp.to_string()));
+            self
+        }
+    }
+
+    #[async_trait]
+    impl PgAccess for FakePg {
+        async fn query_f64(&self, query: &str) -> (f64, String) {
+            self.query_results
+                .lock()
+                .expect("fake pg query results mutex")
+                .get(query)
+                .cloned()
+                .unwrap_or((0.0, String::new()))
+        }
+
+        async fn write_dhw(&self, _s: &DhwState) {}
+    }
+
+    fn test_app_state(pg: Arc<dyn PgAccess>) -> AppState {
         let (cmd_tx, _) = broadcast::channel(8);
         AppState {
             http_client: reqwest::Client::new(),
+            pg,
             cmd_tx,
             z2m_state: Arc::new(Mutex::new(std::collections::HashMap::new())),
             dhw_state: Arc::new(Mutex::new(test_state())),
-            config: Arc::new(HubConfig::default()),
         }
+    }
+
+    fn dead_test_pg() -> Arc<dyn PgAccess> {
+        Arc::new(FakePg::default())
     }
 
     fn heating_test_lock() -> &'static Mutex<()> {
@@ -1768,40 +1993,6 @@ mod tests {
                     .await
                     .expect("write ebusd response");
             }
-        })
-    }
-
-    async fn spawn_influx_test_server(
-        body: &'static str,
-        queries: Arc<std::sync::Mutex<Vec<String>>>,
-    ) -> tokio::task::JoinHandle<()> {
-        let app = axum::Router::new().route(
-            "/api/v2/query",
-            axum::routing::post({
-                let queries = queries.clone();
-                move |request_body: String| {
-                    let queries = queries.clone();
-                    async move {
-                        queries
-                            .lock()
-                            .expect("recorded queries mutex")
-                            .push(request_body);
-                        (
-                            [(axum::http::header::CONTENT_TYPE, "application/csv")],
-                            body,
-                        )
-                    }
-                }
-            }),
-        );
-
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 8086))
-            .await
-            .expect("bind influx test server");
-        tokio::spawn(async move {
-            axum::serve(listener, app)
-                .await
-                .expect("run influx test server");
         })
     }
 
@@ -2159,7 +2350,11 @@ mod tests {
     // @lat: [[tests#Config loading#Missing config file falls back to built in defaults]]
     #[test]
     fn missing_config_file_falls_back_to_built_in_defaults() {
-        let missing = format!("/tmp/z2m-hub-missing-{}-{}.toml", std::process::id(), Instant::now().elapsed().as_nanos());
+        let missing = format!(
+            "/tmp/z2m-hub-missing-{}-{}.toml",
+            std::process::id(),
+            Instant::now().elapsed().as_nanos()
+        );
 
         let cfg = HubConfig::load(&missing);
 
@@ -2194,7 +2389,11 @@ gap_dissolved = 2.0
     // @lat: [[tests#Config loading#Invalid config falls back to built in defaults]]
     #[test]
     fn invalid_config_falls_back_to_built_in_defaults() {
-        let path = format!("/tmp/z2m-hub-invalid-{}-{}.toml", std::process::id(), Instant::now().elapsed().as_nanos());
+        let path = format!(
+            "/tmp/z2m-hub-invalid-{}-{}.toml",
+            std::process::id(),
+            Instant::now().elapsed().as_nanos()
+        );
         std::fs::write(&path, "not = [valid toml").expect("write invalid config");
 
         let cfg = HubConfig::load(&path);
@@ -2204,6 +2403,66 @@ gap_dissolved = 2.0
         assert_eq!(cfg.dhw.gap_dissolved, 1.5);
         assert_eq!(cfg.dhw.full_litres_min, 160.0);
         assert_eq!(cfg.dhw.full_litres_max, 220.0);
+    }
+
+    // ── Password resolution order ──────────────────────────────────────
+
+    // @lat: [[tests#Password resolution#Systemd credential is used when available]]
+    #[test]
+    fn systemd_credential_is_used_when_available() {
+        with_env_var_removed("PGPASSWORD", || {
+            let dir = format!("/tmp/z2m-creds-{}", std::process::id());
+            std::fs::create_dir_all(&dir).expect("create temp creds dir");
+            std::fs::write(format!("{dir}/pgpassword"), "cred-secret\n").expect("write cred file");
+
+            std::env::set_var("CREDENTIALS_DIRECTORY", &dir);
+
+            let cfg = DatabaseConfig::default();
+            let pw = cfg.resolve_password();
+
+            std::env::remove_var("CREDENTIALS_DIRECTORY");
+            let _ = std::fs::remove_dir_all(&dir);
+
+            assert_eq!(pw.as_deref(), Some("cred-secret"));
+        });
+    }
+
+    // @lat: [[tests#Password resolution#Connection string includes resolved password]]
+    #[test]
+    fn connection_string_includes_resolved_password() {
+        with_env_var_removed("PGPASSWORD", || {
+            let dir = format!("/tmp/z2m-creds-conn-{}", std::process::id());
+            std::fs::create_dir_all(&dir).expect("create temp creds dir");
+            std::fs::write(format!("{dir}/pgpassword"), "test-pw").expect("write cred file");
+
+            std::env::set_var("CREDENTIALS_DIRECTORY", &dir);
+
+            let cfg = DatabaseConfig::default();
+            let conn = cfg.to_connection_string();
+
+            std::env::remove_var("CREDENTIALS_DIRECTORY");
+            let _ = std::fs::remove_dir_all(&dir);
+
+            assert!(
+                conn.contains("password=test-pw"),
+                "conn string must include password: {conn}"
+            );
+        });
+    }
+
+    // @lat: [[tests#Password resolution#Connection string omits password when none resolved]]
+    #[test]
+    fn connection_string_omits_password_when_none_resolved() {
+        with_env_var_removed("PGPASSWORD", || {
+            std::env::remove_var("CREDENTIALS_DIRECTORY");
+
+            let cfg = DatabaseConfig::default();
+            let conn = cfg.to_connection_string();
+            assert!(
+                !conn.contains("password"),
+                "conn string must not include password field: {conn}"
+            );
+        });
     }
 
     // @lat: [[tests#eBUS interface#Status01 hwc suffix marks charging]]
@@ -2231,61 +2490,6 @@ gap_dissolved = 2.0
 
         assert!(!charging);
         assert_eq!(return_temp, 0.0);
-    }
-
-    // ── Influx and heating helper tests ──────────────────────────────────
-
-    // @lat: [[tests#InfluxDB interface#Influx parser uses the last value row]]
-    #[test]
-    fn influx_parser_uses_the_last_value_row() {
-        let body = "#datatype,string,long,dateTime:RFC3339,double\n,result,table,_time,_value\n,,0,2026-04-10T10:00:00Z,41.5\n,,0,2026-04-10T10:05:00Z,42.75\n";
-
-        let (value, timestamp) = parse_influx_query_csv(body);
-
-        assert_eq!(value, 42.75);
-        assert_eq!(timestamp, "2026-04-10T10:05:00Z");
-    }
-
-    // @lat: [[tests#InfluxDB interface#Influx parser ignores comments and malformed values]]
-    #[test]
-    fn influx_parser_ignores_comments_and_malformed_values() {
-        let body = "#group,false,false,true,false\n#datatype,string,long,dateTime:RFC3339,double\n,result,table,_time,_value\n,,0,2026-04-10T10:00:00Z,40.0\n,,0,2026-04-10T10:05:00Z,not-a-number\n";
-
-        let (value, timestamp) = parse_influx_query_csv(body);
-
-        assert_eq!(value, 40.0);
-        assert_eq!(timestamp, "2026-04-10T10:05:00Z");
-    }
-
-    // @lat: [[tests#InfluxDB interface#Influx parser returns zero defaults for empty body]]
-    #[test]
-    fn influx_parser_returns_zero_defaults_for_empty_body() {
-        let (value, timestamp) = parse_influx_query_csv("");
-
-        assert_eq!(value, 0.0);
-        assert_eq!(timestamp, "");
-    }
-
-    // @lat: [[tests#InfluxDB interface#Influx parser returns zero defaults for headers only]]
-    #[test]
-    fn influx_parser_returns_zero_defaults_for_headers_only() {
-        let body = "#datatype,string,long,dateTime:RFC3339,double\n,result,table,_time,_value\n";
-
-        let (value, timestamp) = parse_influx_query_csv(body);
-
-        assert_eq!(value, 0.0);
-        assert_eq!(timestamp, "");
-    }
-
-    // @lat: [[tests#InfluxDB interface#Influx parser returns zero defaults when value column missing]]
-    #[test]
-    fn influx_parser_returns_zero_defaults_when_value_column_missing() {
-        let body = ",result,table,_time,something_else\n,,0,2026-04-10T10:00:00Z,42.0\n";
-
-        let (value, timestamp) = parse_influx_query_csv(body);
-
-        assert_eq!(value, 0.0);
-        assert_eq!(timestamp, "");
     }
 
     // ── DHW write format (pre-migration regression) ───────────────────
@@ -2319,7 +2523,10 @@ gap_dissolved = 2.0
 
         assert!(lp.starts_with("dhw "), "measurement must be 'dhw'");
         assert!(lp.contains("remaining_litres=134.5"));
-        assert!(lp.contains("model_version=2i"), "model_version must be integer-typed");
+        assert!(
+            lp.contains("model_version=2i"),
+            "model_version must be integer-typed"
+        );
         assert!(lp.contains("t1=51.23"));
         assert!(lp.contains("hwc_storage=47.89"));
         assert!(lp.contains("effective_t1=49.67"));
@@ -2366,46 +2573,42 @@ gap_dissolved = 2.0
         }
     }
 
+    // @lat: [[tests#PostgreSQL interface#Query fallback returns zero defaults on transport failure]]
+    #[tokio::test]
+    async fn query_fallback_returns_zero_defaults_on_transport_failure() {
+        let pg = dead_pg_client().await;
+
+        let (value, timestamp) = query_pg_f64(
+            pg.as_ref(),
+            "SELECT dhw_t1, time FROM multical ORDER BY time DESC LIMIT 1",
+            &[],
+        )
+        .await;
+
+        assert_eq!(value, 0.0);
+        assert_eq!(timestamp, "");
+    }
+
     // @lat: [[tests#DHW write format#Write failure does not stop the caller]]
     #[tokio::test]
     async fn write_failure_does_not_stop_the_caller() {
-        let _guard = dhw_http_test_lock().lock().await;
-
-        // Mock server that returns 500 for writes
-        let app = axum::Router::new().route(
-            "/api/v2/write",
-            axum::routing::post(|| async {
-                (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "db down")
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 8086))
-            .await
-            .expect("bind write test server");
-        let server = tokio::spawn(async move {
-            axum::serve(listener, app)
-                .await
-                .expect("run write test server");
-        });
-
-        let client = reqwest::Client::new();
+        // Dead PG client — connection has been dropped, every query fails
+        let pg = dead_pg_client().await;
         let s = test_state();
 
         // This must return normally — not panic, not propagate an error
-        write_dhw_to_influxdb(&client, &s).await;
-
-        server.abort();
-        let _ = server.await;
+        write_dhw_to_pg(pg.as_ref(), &s).await;
     }
 
     // @lat: [[tests#DHW write format#Write to unreachable server does not stop the caller]]
     #[tokio::test]
     async fn write_to_unreachable_server_does_not_stop_the_caller() {
-        // No server running — connection refused
-        let client = reqwest::Client::new();
+        // Dead PG client — simulates unreachable server
+        let pg = dead_pg_client().await;
         let s = test_state();
 
         // This must return normally despite the transport error
-        write_dhw_to_influxdb(&client, &s).await;
+        write_dhw_to_pg(pg.as_ref(), &s).await;
     }
 
     // ── Autoload bounds logic (pre-migration regression) ────────────
@@ -2497,7 +2700,7 @@ gap_dissolved = 2.0
         let _guard = heating_test_lock().lock().await;
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
         let server = spawn_heating_test_server(requests.clone()).await;
-        let state = test_app_state();
+        let state = test_app_state(dead_test_pg());
 
         let Json(resp) = api_heating_status(State(state)).await;
 
@@ -2517,7 +2720,7 @@ gap_dissolved = 2.0
         let _guard = heating_test_lock().lock().await;
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
         let server = spawn_heating_test_server(requests.clone()).await;
-        let state = test_app_state();
+        let state = test_app_state(dead_test_pg());
 
         let Json(mode_resp) = api_heating_mode(
             State(state.clone()),
@@ -2526,7 +2729,10 @@ gap_dissolved = 2.0
         .await;
         let Json(kill_resp) = api_heating_kill(State(state)).await;
 
-        assert_eq!(mode_resp, serde_json::json!({"ok": true, "mode": "comfort"}));
+        assert_eq!(
+            mode_resp,
+            serde_json::json!({"ok": true, "mode": "comfort"})
+        );
         assert_eq!(kill_resp, serde_json::json!({"ok": true, "killed": true}));
         assert_eq!(
             requests.lock().expect("recorded requests mutex").as_slice(),
@@ -2546,12 +2752,15 @@ gap_dissolved = 2.0
         let _guard = heating_test_lock().lock().await;
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
         let server = spawn_heating_test_server(requests.clone()).await;
-        let state = test_app_state();
+        let state = test_app_state(dead_test_pg());
         let body = serde_json::json!({"until": "2026-04-11T18:30:00Z", "reason": "school run"});
 
         let Json(resp) = api_heating_away(State(state), Json(body.clone())).await;
 
-        assert_eq!(resp, serde_json::json!({"ok": true, "until": "2026-04-11T18:30:00Z"}));
+        assert_eq!(
+            resp,
+            serde_json::json!({"ok": true, "until": "2026-04-11T18:30:00Z"})
+        );
         assert_eq!(
             requests.lock().expect("recorded requests mutex").as_slice(),
             &[("POST /mode/away".to_string(), Some(body))]
@@ -2566,7 +2775,7 @@ gap_dissolved = 2.0
     // @lat: [[tests#HTTP API#Light toggle uses cached ON state to send OFF]]
     #[tokio::test]
     async fn light_toggle_uses_cached_on_state_to_send_off() {
-        let state = test_app_state();
+        let state = test_app_state(dead_test_pg());
         let mut cmd_rx = state.cmd_tx.subscribe();
         {
             let mut zs = state.z2m_state.lock().await;
@@ -2591,7 +2800,7 @@ gap_dissolved = 2.0
     // @lat: [[tests#HTTP API#Light toggle assumes OFF when cache is missing]]
     #[tokio::test]
     async fn light_toggle_assumes_off_when_cache_is_missing() {
-        let state = test_app_state();
+        let state = test_app_state(dead_test_pg());
         let mut cmd_rx = state.cmd_tx.subscribe();
 
         let Json(resp) = api_light_toggle(
@@ -2612,7 +2821,7 @@ gap_dissolved = 2.0
     // @lat: [[tests#HTTP API#Unknown light commands fail without publishing Zigbee traffic]]
     #[tokio::test]
     async fn unknown_light_command_fails_without_publishing() {
-        let state = test_app_state();
+        let state = test_app_state(dead_test_pg());
         let mut cmd_rx = state.cmd_tx.subscribe();
 
         let Json(resp) = api_light_on(
@@ -2621,14 +2830,17 @@ gap_dissolved = 2.0
         )
         .await;
 
-        assert_eq!(resp, serde_json::json!({"ok": false, "error": "unknown light"}));
+        assert_eq!(
+            resp,
+            serde_json::json!({"ok": false, "error": "unknown light"})
+        );
         assert!(cmd_rx.try_recv().is_err());
     }
 
     // @lat: [[tests#HTTP API#Light on and off publish the requested state for known lights]]
     #[tokio::test]
     async fn light_on_and_off_publish_requested_state_for_known_lights() {
-        let state = test_app_state();
+        let state = test_app_state(dead_test_pg());
         let mut cmd_rx = state.cmd_tx.subscribe();
 
         let Json(on_resp) = api_light_on(
@@ -2636,8 +2848,13 @@ gap_dissolved = 2.0
             axum::extract::Path("hall".to_string()),
         )
         .await;
-        assert_eq!(on_resp, serde_json::json!({"ok": true, "light": "hall", "state": "ON"}));
-        let on_msg = cmd_rx.try_recv().expect("light on should publish a command");
+        assert_eq!(
+            on_resp,
+            serde_json::json!({"ok": true, "light": "hall", "state": "ON"})
+        );
+        let on_msg = cmd_rx
+            .try_recv()
+            .expect("light on should publish a command");
         assert_eq!(on_msg.topic, "hall/set");
         assert_eq!(on_msg.payload, serde_json::json!({"state": "ON"}));
 
@@ -2646,8 +2863,13 @@ gap_dissolved = 2.0
             axum::extract::Path("top_landing".to_string()),
         )
         .await;
-        assert_eq!(off_resp, serde_json::json!({"ok": true, "light": "top_landing", "state": "OFF"}));
-        let off_msg = cmd_rx.try_recv().expect("light off should publish a command");
+        assert_eq!(
+            off_resp,
+            serde_json::json!({"ok": true, "light": "top_landing", "state": "OFF"})
+        );
+        let off_msg = cmd_rx
+            .try_recv()
+            .expect("light off should publish a command");
         assert_eq!(off_msg.topic, "top_landing/set");
         assert_eq!(off_msg.payload, serde_json::json!({"state": "OFF"}));
 
@@ -2657,7 +2879,7 @@ gap_dissolved = 2.0
     // @lat: [[tests#HTTP API#Lights state reports missing cache entries as off]]
     #[tokio::test]
     async fn lights_state_reports_missing_cache_entries_as_off() {
-        let state = test_app_state();
+        let state = test_app_state(dead_test_pg());
         {
             let mut zs = state.z2m_state.lock().await;
             zs.insert("hall".to_string(), serde_json::json!({"state": "ON"}));
@@ -2668,13 +2890,16 @@ gap_dissolved = 2.0
         assert_eq!(resp["ok"], serde_json::json!(true));
         assert_eq!(resp["lights"]["hall"]["on"], serde_json::json!(true));
         assert_eq!(resp["lights"]["landing"]["on"], serde_json::json!(false));
-        assert_eq!(resp["lights"]["top_landing"]["on"], serde_json::json!(false));
+        assert_eq!(
+            resp["lights"]["top_landing"]["on"],
+            serde_json::json!(false)
+        );
     }
 
     // @lat: [[tests#HTTP API#Hot water endpoint returns the current DHW snapshot]]
     #[tokio::test]
     async fn hot_water_endpoint_returns_the_current_dhw_snapshot() {
-        let state = test_app_state();
+        let state = test_app_state(dead_test_pg());
         {
             let mut dhw = state.dhw_state.lock().await;
             dhw.remaining = 91.5;
@@ -2708,7 +2933,7 @@ gap_dissolved = 2.0
             "done".to_string(),
         )]));
         let ebusd = spawn_ebusd_test_server(responses, commands.clone()).await;
-        let state = test_app_state();
+        let state = test_app_state(dead_test_pg());
 
         let Json(resp) = api_dhw_boost(State(state)).await;
 
@@ -2731,7 +2956,7 @@ gap_dissolved = 2.0
             "busy".to_string(),
         )]));
         let ebusd = spawn_ebusd_test_server(responses, commands.clone()).await;
-        let state = test_app_state();
+        let state = test_app_state(dead_test_pg());
 
         let Json(resp) = api_dhw_boost(State(state)).await;
 
@@ -2744,17 +2969,13 @@ gap_dissolved = 2.0
         let _ = ebusd.await;
     }
 
-    // @lat: [[tests#HTTP API#DHW status combines ebusd and Influx readings into one snapshot]]
+    // @lat: [[tests#HTTP API#DHW status combines ebusd and database readings into one snapshot]]
     #[tokio::test]
-    async fn dhw_status_combines_ebusd_and_influx_readings_into_one_snapshot() {
+    async fn dhw_status_combines_ebusd_and_db_readings_into_one_snapshot() {
         let _guard = dhw_http_test_lock().lock().await;
         let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let queries = Arc::new(std::sync::Mutex::new(Vec::new()));
         let responses = Arc::new(std::collections::HashMap::from([
-            (
-                "read -f -c 700 HwcSFMode".to_string(),
-                "load".to_string(),
-            ),
+            ("read -f -c 700 HwcSFMode".to_string(), "load".to_string()),
             (
                 "read -f -c hmu Status01".to_string(),
                 "55.0;38.5;10.0;60.0;48.2;off".to_string(),
@@ -2769,12 +2990,14 @@ gap_dissolved = 2.0
             ),
         ]));
         let ebusd = spawn_ebusd_test_server(responses, commands.clone()).await;
-        let influx = spawn_influx_test_server(
-            ",result,table,_time,_value\n,,0,2026-04-11T11:15:00Z,49.75\n",
-            queries.clone(),
-        )
-        .await;
-        let state = test_app_state();
+        let pg = Arc::new(FakePg::default().with_query_result(
+            "SELECT dhw_t1, time FROM multical \
+             WHERE time >= now() - interval '1 hour' \
+             ORDER BY time DESC LIMIT 1",
+            49.75,
+            "2026-04-11T11:15:00Z",
+        ));
+        let state = test_app_state(pg);
 
         let Json(resp) = api_dhw_status(State(state)).await;
 
@@ -2794,30 +3017,30 @@ gap_dissolved = 2.0
                 "read -f -c 700 HwcStorageTemp".to_string(),
             ]
         );
-        assert!(queries.lock().expect("recorded queries mutex")[0].contains("dhw_t1"));
 
         let _ = ebusd.await;
-        influx.abort();
-        let _ = influx.await;
     }
 
     // @lat: [[tests#HTTP API#DHW status falls back to safe defaults when upstream reads fail]]
     #[tokio::test]
     async fn dhw_status_falls_back_to_safe_defaults_when_upstream_reads_fail() {
         let _guard = dhw_http_test_lock().lock().await;
-        let state = test_app_state();
+        let state = test_app_state(dead_test_pg());
 
         let Json(resp) = api_dhw_status(State(state)).await;
 
-        assert_eq!(resp, serde_json::json!({
-            "ok": true,
-            "charging": false,
-            "sfmode": "",
-            "t1_hot": 0.0,
-            "cylinder_temp": 0.0,
-            "return_temp": 0.0,
-            "target_temp": 0.0,
-        }));
+        assert_eq!(
+            resp,
+            serde_json::json!({
+                "ok": true,
+                "charging": false,
+                "sfmode": "",
+                "t1_hot": 0.0,
+                "cylinder_temp": 0.0,
+                "return_temp": 0.0,
+                "target_temp": 0.0,
+            })
+        );
     }
 
     // ── Motion automation tests ─────────────────────────────────────────
@@ -2901,7 +3124,10 @@ gap_dissolved = 2.0
         drop(s);
 
         let zs = z2m_state.lock().await;
-        assert_eq!(zs.get("hall_motion"), Some(&serde_json::json!({"occupancy": true, "illuminance": 10.0})));
+        assert_eq!(
+            zs.get("hall_motion"),
+            Some(&serde_json::json!({"occupancy": true, "illuminance": 10.0}))
+        );
     }
 
     // @lat: [[tests#Motion lighting automation#Motion at the darkness threshold still triggers the lights]]
@@ -2919,8 +3145,14 @@ gap_dissolved = 2.0
         )
         .await;
 
-        assert_eq!(cmd_rx.try_recv().expect("first ON command").topic, "landing/set");
-        assert_eq!(cmd_rx.try_recv().expect("second ON command").topic, "hall/set");
+        assert_eq!(
+            cmd_rx.try_recv().expect("first ON command").topic,
+            "landing/set"
+        );
+        assert_eq!(
+            cmd_rx.try_recv().expect("second ON command").topic,
+            "hall/set"
+        );
         assert!(cmd_rx.try_recv().is_err());
 
         let s = state.lock().await;
@@ -3048,8 +3280,14 @@ gap_dissolved = 2.0
         )
         .await;
 
-        assert_eq!(cmd_rx.try_recv().expect("first ON command").topic, "landing/set");
-        assert_eq!(cmd_rx.try_recv().expect("second ON command").topic, "hall/set");
+        assert_eq!(
+            cmd_rx.try_recv().expect("first ON command").topic,
+            "landing/set"
+        );
+        assert_eq!(
+            cmd_rx.try_recv().expect("second ON command").topic,
+            "hall/set"
+        );
 
         let s = state.lock().await;
         assert!(s.suppressed_until.is_none());
@@ -3072,8 +3310,14 @@ gap_dissolved = 2.0
         tokio::time::advance(Duration::from_secs(2)).await;
         tokio::task::yield_now().await;
 
-        assert_eq!(cmd_rx.try_recv().expect("first OFF command").topic, "landing/set");
-        assert_eq!(cmd_rx.try_recv().expect("second OFF command").topic, "hall/set");
+        assert_eq!(
+            cmd_rx.try_recv().expect("first OFF command").topic,
+            "landing/set"
+        );
+        assert_eq!(
+            cmd_rx.try_recv().expect("second OFF command").topic,
+            "hall/set"
+        );
         assert!(cmd_rx.try_recv().is_err());
 
         {
@@ -3107,32 +3351,30 @@ gap_dissolved = 2.0
         /// Config strategy with sane ranges
         fn arb_cfg() -> impl Strategy<Value = DhwConfig> {
             (
-                100.0..300.0_f64,  // full_litres
-                0.1..1.0_f64,      // t1_decay_rate
-                35.0..45.0_f64,    // reduced_t1
-                2.0..10.0_f64,     // hwc_crash_threshold
-                50.0..200.0_f64,   // vol_above_hwc
-                50.0..200.0_f64,   // draw_flow_min
+                100.0..300.0_f64, // full_litres
+                0.1..1.0_f64,     // t1_decay_rate
+                35.0..45.0_f64,   // reduced_t1
+                2.0..10.0_f64,    // hwc_crash_threshold
+                50.0..200.0_f64,  // vol_above_hwc
+                50.0..200.0_f64,  // draw_flow_min
             )
-                .prop_flat_map(
-                    |(full, decay, reduced, crash, vol, flow)| {
-                        // gap_dissolved must be < gap_sharp
-                        (0.5..5.0_f64).prop_flat_map(move |gap_d| {
-                            ((gap_d + 0.1)..10.0_f64).prop_map(move |gap_s| DhwConfig {
-                                full_litres: full,
-                                t1_decay_rate: decay,
-                                reduced_t1: reduced,
-                                hwc_crash_threshold: crash,
-                                vol_above_hwc: vol,
-                                draw_flow_min: flow,
-                                gap_sharp: gap_s,
-                                gap_dissolved: gap_d,
-                                full_litres_min: 160.0,
-                                full_litres_max: 220.0,
-                            })
+                .prop_flat_map(|(full, decay, reduced, crash, vol, flow)| {
+                    // gap_dissolved must be < gap_sharp
+                    (0.5..5.0_f64).prop_flat_map(move |gap_d| {
+                        ((gap_d + 0.1)..10.0_f64).prop_map(move |gap_s| DhwConfig {
+                            full_litres: full,
+                            t1_decay_rate: decay,
+                            reduced_t1: reduced,
+                            hwc_crash_threshold: crash,
+                            vol_above_hwc: vol,
+                            draw_flow_min: flow,
+                            gap_sharp: gap_s,
+                            gap_dissolved: gap_d,
+                            full_litres_min: 160.0,
+                            full_litres_max: 220.0,
                         })
-                    },
-                )
+                    })
+                })
         }
 
         proptest! {
@@ -3262,5 +3504,230 @@ gap_dissolved = 2.0
                     "effective_t1 {} > t1_at_charge_end {}", s.effective_t1, t1_end);
             }
         }
+    }
+
+    // ── Real PostgreSQL integration tests ─────────────────────────────
+    //
+    // Gated with #[ignore] — run with `cargo test -- --ignored` on a
+    // machine that can reach TimescaleDB at 10.0.1.230:5432.
+
+    /// Connect to the real PostgreSQL instance using z2m-hub.toml config.
+    /// Panics if unreachable — these tests are #[ignore]d for exactly that reason.
+    async fn real_pg_client() -> tokio_postgres::Client {
+        let config = HubConfig::load(CONFIG_PATH);
+        let conn_str = config.database.to_connection_string();
+        let (client, connection) = tokio_postgres::connect(&conn_str, tokio_postgres::NoTls)
+            .await
+            .expect("connect to real PostgreSQL");
+        tokio::spawn(connection);
+        client
+    }
+
+    // @lat: [[tests#Real PostgreSQL integration#Row decoding returns f64 and timestamp string]]
+    #[tokio::test]
+    #[ignore]
+    async fn pg_row_decoding_returns_f64_and_timestamp() {
+        let pg = real_pg_client().await;
+        let (value, ts) = query_pg_f64(
+            &pg,
+            "SELECT dhw_t1, time FROM multical \
+             WHERE time >= now() - interval '1 hour' \
+             ORDER BY time DESC LIMIT 1",
+            &[],
+        )
+        .await;
+        // If there's recent data, value should be a plausible temperature
+        // and timestamp should be a non-empty RFC3339 string.
+        // If no data in the last hour, both default to zero — still valid.
+        assert!(
+            value >= 0.0,
+            "temperature must be non-negative, got {value}"
+        );
+        if value > 0.0 {
+            assert!(!ts.is_empty(), "non-zero value must have a timestamp");
+            assert!(value < 100.0, "temperature must be plausible, got {value}");
+        }
+    }
+
+    // @lat: [[tests#Real PostgreSQL integration#INSERT includes explicit time column]]
+    #[tokio::test]
+    #[ignore]
+    async fn pg_insert_includes_explicit_time_column() {
+        let mut pg = real_pg_client().await;
+        let tx = pg.transaction().await.expect("start transaction");
+
+        let mut s = test_state();
+        s.remaining = 111.111; // distinctive value to find our row inside this transaction
+        write_dhw_to_pg(&tx, &s).await;
+
+        // Find our specific row by its distinctive remaining value
+        let row = tx
+            .query_one(
+                "SELECT time FROM dhw \
+                 WHERE remaining_litres = 111.111 \
+                 ORDER BY time DESC LIMIT 1",
+                &[],
+            )
+            .await
+            .expect("read back inserted row");
+
+        let time: chrono::DateTime<chrono::Utc> = row.get(0);
+        let age = chrono::Utc::now() - time;
+        assert!(
+            age.num_seconds() < 10,
+            "inserted row must have a recent timestamp, age={age}"
+        );
+
+        tx.rollback().await.expect("rollback transaction");
+    }
+
+    // @lat: [[tests#Real PostgreSQL integration#INSERT column types match dhw table schema]]
+    #[tokio::test]
+    #[ignore]
+    async fn pg_insert_column_types_match_schema() {
+        let mut pg = real_pg_client().await;
+        let tx = pg.transaction().await.expect("start transaction");
+
+        let mut s = test_state();
+        s.remaining = 122.222; // distinctive value to find our row inside this transaction
+        write_dhw_to_pg(&tx, &s).await;
+
+        // Find our specific row by its distinctive remaining value
+        let row = tx
+            .query_one(
+                "SELECT time, remaining_litres, model_version, t1, hwc_storage, \
+                 effective_t1, charge_state, crossover, bottom_zone_hot \
+                 FROM dhw WHERE remaining_litres = 122.222 \
+                 ORDER BY time DESC LIMIT 1",
+                &[],
+            )
+            .await
+            .expect("read back all columns");
+
+        // Type assertions — these will panic if the column type doesn't match
+        let _time: chrono::DateTime<chrono::Utc> = row.get(0);
+        let remaining: f64 = row.get(1);
+        let model_version: i32 = row.get(2);
+        let t1: f64 = row.get(3);
+        let hwc_storage: f64 = row.get(4);
+        let effective_t1: f64 = row.get(5);
+        let charge_state: String = row.get(6);
+        let crossover: bool = row.get(7);
+        let bottom_zone_hot: bool = row.get(8);
+
+        assert!((remaining - 122.222).abs() < f64::EPSILON);
+        assert_eq!(model_version, 2);
+        assert!((t1 - s.current_t1).abs() < f64::EPSILON);
+        assert!((hwc_storage - s.current_hwc).abs() < f64::EPSILON);
+        assert!((effective_t1 - s.effective_t1).abs() < f64::EPSILON);
+        assert_eq!(charge_state, s.charge_state.to_string());
+        assert_eq!(crossover, s.crossover_achieved);
+        assert_eq!(bottom_zone_hot, s.current_hwc > 30.0);
+
+        tx.rollback().await.expect("rollback transaction");
+    }
+
+    // @lat: [[tests#Real PostgreSQL integration#Consecutive writes produce distinct rows]]
+    #[tokio::test]
+    #[ignore]
+    async fn pg_consecutive_writes_produce_distinct_rows() {
+        let mut pg = real_pg_client().await;
+        let tx = pg.transaction().await.expect("start transaction");
+
+        // Use distinctive values that no other test uses
+        let mut s1 = test_state();
+        s1.remaining = 133.331;
+        write_dhw_to_pg(&tx, &s1).await;
+
+        let mut s2 = test_state();
+        s2.remaining = 133.332;
+        write_dhw_to_pg(&tx, &s2).await;
+
+        // Find both rows by their distinctive values
+        let rows = tx
+            .query(
+                "SELECT time, remaining_litres FROM dhw \
+                 WHERE remaining_litres IN (133.331, 133.332) \
+                 ORDER BY time ASC",
+                &[],
+            )
+            .await
+            .expect("read back test rows");
+
+        assert!(
+            rows.len() >= 2,
+            "two consecutive writes must produce at least 2 rows, got {}",
+            rows.len()
+        );
+
+        let t1: chrono::DateTime<chrono::Utc> = rows[0].get(0);
+        let t2: chrono::DateTime<chrono::Utc> = rows[rows.len() - 1].get(0);
+        assert!(t2 >= t1, "second write must have equal or later timestamp");
+
+        tx.rollback().await.expect("rollback transaction");
+    }
+
+    // @lat: [[tests#Real PostgreSQL integration#End-to-end read and write against seeded tables]]
+    #[tokio::test]
+    #[ignore]
+    async fn pg_end_to_end_seeded_integration() {
+        let mut pg = real_pg_client().await;
+        let tx = pg.transaction().await.expect("start transaction");
+
+        // Verify we can read from all three tables the service depends on
+        let multical = query_pg_f64(
+            &tx,
+            "SELECT dhw_volume_v1, time FROM multical \
+             WHERE time >= now() - interval '1 hour' \
+             ORDER BY time DESC LIMIT 1",
+            &[],
+        )
+        .await;
+        assert!(multical.0 >= 0.0, "volume must be non-negative");
+
+        let dhw = query_pg_f64(
+            &tx,
+            "SELECT remaining_litres, time FROM dhw \
+             WHERE time >= now() - interval '24 hours' \
+             ORDER BY time DESC LIMIT 1",
+            &[],
+        )
+        .await;
+        assert!(dhw.0 >= 0.0, "remaining_litres must be non-negative");
+
+        let capacity = query_pg_f64(
+            &tx,
+            "SELECT recommended_full_litres, time FROM dhw_capacity \
+             WHERE time >= now() - interval '90 days' \
+             ORDER BY time DESC LIMIT 1",
+            &[],
+        )
+        .await;
+        assert!(
+            capacity.0 >= 0.0,
+            "recommended_full_litres must be non-negative"
+        );
+
+        // Write and read back — round-trip verification
+        let mut s = test_state();
+        s.remaining = 123.456;
+        write_dhw_to_pg(&tx, &s).await;
+
+        let (readback, ts) = query_pg_f64(
+            &tx,
+            "SELECT remaining_litres, time FROM dhw \
+             WHERE time >= now() - interval '10 seconds' \
+             ORDER BY time DESC LIMIT 1",
+            &[],
+        )
+        .await;
+
+        assert!(
+            (readback - 123.456).abs() < f64::EPSILON,
+            "round-trip remaining must match: got {readback}"
+        );
+        assert!(!ts.is_empty(), "round-trip must have a timestamp");
+
+        tx.rollback().await.expect("rollback transaction");
     }
 }

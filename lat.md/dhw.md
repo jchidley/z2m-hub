@@ -4,13 +4,13 @@ This file describes how z2m-hub models the current state of domestic hot water i
 
 ## DHW tracking model
 
-z2m-hub estimates remaining usable hot water by combining ebusd state, InfluxDB sensor history, and a physics-based charge/draw model.
+z2m-hub estimates remaining usable hot water by combining ebusd state, PostgreSQL/TimescaleDB sensor history, and a physics-based charge/draw model.
 
 ## Inputs and polling
 
 The DHW loop polls all required signals every 10 seconds.
 
-The model reads charge state from eBUS, `HwcStorageTemp` from eBUS, and T1, draw flow, and cumulative volume from InfluxDB. The shared state for this model lives in `DhwState`, while the highest-value state transitions now sit in small pure charge-completion and draw-tracking helpers that the loop calls after polling.
+The model reads charge state from eBUS, `HwcStorageTemp` from eBUS, and T1, draw flow, and cumulative volume from PostgreSQL. The shared state for this model lives in `DhwState`, while the highest-value state transitions now sit in small pure charge-completion and draw-tracking helpers that the loop calls after polling.
 
 ## Charge detection
 
@@ -49,7 +49,7 @@ The loop always applies draw tracking when flow exceeds `draw_flow_min`. It subt
 - exact T1 drops of 0.5°C or 1.5°C stay on the weaker branch because both thresholds are strict `>` checks
 - if both the HwcStorage crash and severe T1-drop conditions appear in the same update, the zero-litre T1 rule wins
 
-This protects against overestimating usable water late in a shower sequence. The async loop still owns sensor polling and persistence, but the litre/cap calculations themselves are factored so they can be unit-tested without InfluxDB or eBUS fixtures.
+This protects against overestimating usable water late in a shower sequence. The async loop still owns sensor polling and persistence, but the litre/cap calculations themselves are factored so they can be unit-tested without database or eBUS fixtures.
 
 ## Standby decay
 
@@ -59,6 +59,6 @@ The model cools the effective top temperature over time without deleting litres 
 
 ## Capacity autoload and persistence
 
-Configured capacity can be upgraded at startup from a recommended InfluxDB value and the live estimate is written back after updates.
+Configured capacity can be upgraded at startup from a recommended database value and the live estimate is written back after updates.
 
-`z2m-hub.toml` provides defaults and sane bounds. At startup, the service loads `recommended_full_litres` from InfluxDB, takes the max of config and recommended values when the recommendation is sane, and writes the current estimate back to the `dhw` measurement during operation.
+`z2m-hub.toml` provides defaults and sane bounds. At startup, the service loads `recommended_full_litres` from the `dhw_capacity` table in PostgreSQL, takes the max of config and recommended values when the recommendation is sane, and writes the current estimate back to the `dhw` table during operation.

@@ -182,13 +182,15 @@ The dashboard lights-state endpoint must include every configured light and mark
 
 The hot-water endpoint must mirror the in-memory DHW snapshot fields needed by the dashboard, including litres, temperatures, charge state, and crossover flag.
 
-### DHW status combines ebusd and Influx readings into one snapshot
+### DHW status combines ebusd and database readings into one snapshot
 
-The live DHW-status endpoint must merge ebusd mode and status reads with the latest Influx `dhw_t1` reading, then expose a single dashboard JSON snapshot with charging, temperatures, and target temperature fields.
+The live DHW-status endpoint must merge ebusd mode/status reads with the latest PostgreSQL `dhw_t1` reading into one dashboard JSON snapshot.
+
+The happy-path contract should be proven without needing a live database by injecting a fake PostgreSQL seam that returns a non-zero `dhw_t1` value.
 
 ### DHW status falls back to safe defaults when upstream reads fail
 
-If ebusd commands or the Influx `dhw_t1` query fail or return malformed values, the live DHW-status endpoint must still return `{ "ok": true }` with defaulted dashboard fields rather than failing the whole request.
+If ebusd commands or the PostgreSQL `dhw_t1` query fail or return malformed values, the live DHW-status endpoint must still return `{ "ok": true }` with defaulted dashboard fields rather than failing the whole request.
 
 ### DHW boost returns ok true only for done
 
@@ -206,33 +208,9 @@ When Zigbee2MQTT delivers a non-bridge topic without a slash, z2m-hub must cache
 
 Bridge topics and slash-containing topics such as command acknowledgements must not be inserted into the retained device-state cache because they are not dashboard device snapshots.
 
-## InfluxDB interface
-
-These specs cover the lightweight parsing contract z2m-hub relies on when reading Flux CSV results from InfluxDB.
-
-### Influx parser uses the last value row
-
-When a Flux CSV response contains multiple data rows, the parser must keep the last `_value` and matching `_time` pair because queries use `last()` semantics.
-
-### Influx parser ignores comments and malformed values
-
-The parser must skip annotation lines and leave the previous numeric value intact when a later `_value` cell is not a valid float.
-
-### Influx parser returns zero defaults for empty body
-
-An empty response body must produce `(0.0, "")` so callers that default on error get consistent behaviour whether the HTTP call fails or returns nothing.
-
-### Influx parser returns zero defaults for headers only
-
-A CSV response with annotation and header rows but no data rows must produce `(0.0, "")` rather than panicking.
-
-### Influx parser returns zero defaults when value column missing
-
-When the CSV header row does not contain a `_value` column, the parser must return `(0.0, "")` rather than indexing out of bounds.
-
 ## DHW write format
 
-These specs pin the InfluxDB line-protocol field set and type encoding so the PostgreSQL migration can verify INSERT equivalence.
+These specs pin the line-protocol field set and type encoding as a golden reference so the PostgreSQL INSERT can be verified for field equivalence.
 
 ### LP golden snapshot matches expected field layout
 
@@ -252,11 +230,11 @@ Every `DhwChargeState` variant (`full`, `partial`, `standby`, `charging_below`, 
 
 ### Write failure does not stop the caller
 
-When the database returns a non-success HTTP status, the write function must log the error and return normally so the DHW tracking loop continues.
+When the PostgreSQL connection has failed, the write function must log the error and return normally so the DHW tracking loop continues.
 
 ### Write to unreachable server does not stop the caller
 
-When the database is unreachable (connection refused), the write function must log the transport error and return normally so the DHW tracking loop continues.
+When the PostgreSQL server is unreachable (dead connection), the write function must log the transport error and return normally so the DHW tracking loop continues.
 
 ## DHW autoload
 
@@ -346,6 +324,34 @@ When the TOML file sets only the required DHW fields, omitted sane-bound fields 
 
 When the TOML file exists but cannot be parsed into the expected schema, config loading must fall back to the built-in defaults.
 
+## Password resolution
+
+These specs verify PostgreSQL password resolution in `DatabaseConfig`.
+
+For Pi/Linux services, production uses systemd encrypted credentials; dev/test may use one-shot `PGPASSWORD` injection from `ak` on the trusted dev/test machine. Secrets are never stored in TOML.
+
+### Systemd credential is used when available
+
+When `$CREDENTIALS_DIRECTORY/pgpassword` exists, its content must be used as the password. This is the production path via `systemd-creds encrypt`.
+
+### Connection string includes resolved password
+
+When a password is resolved from either supported source, `to_connection_string()` must include it as a `password=` parameter.
+
+### Connection string omits password when none resolved
+
+When no credential directory is set and no `PGPASSWORD` env var exists, `to_connection_string()` must not include a `password=` parameter.
+
+The test must clear any ambient `PGPASSWORD` first so a developer shell or CI environment cannot create a false failure.
+
+## PostgreSQL interface
+
+These specs cover the fail-safe query/read contract outside the live database integration tests.
+
+### Query fallback returns zero defaults on transport failure
+
+When the PostgreSQL transport has died after connect, `query_pg_f64` must return `(0.0, "")` rather than propagating an error or panicking. This preserves the safety-critical fallback contract used by the DHW model and dashboard handlers.
+
 ## eBUS interface
 
 These specs cover the small parsing rules z2m-hub applies to ebusd text responses before combining them with sensor data.
@@ -361,3 +367,33 @@ The DHW status snapshot must still report charging when `HwcSFMode` is `load` ev
 ### Malformed Status01 falls back to zero return temperature
 
 If Status01 does not contain a parseable return-temperature field, the parsed return temperature must fall back to `0.0` rather than failing the handler.
+
+## Real PostgreSQL integration
+
+These specs require a live TimescaleDB instance and are gated with `#[ignore]`. Run them on the trusted dev/test machine with one-shot `PGPASSWORD=$(ak get timescaledb) cargo test -- --ignored`.
+
+All write-path live-PG tests must run inside a transaction and roll it back before finishing. They exist to verify typing and timestamp behaviour against the real schema, not to leave marker rows in the production `dhw` hypertable.
+
+### Row decoding returns f64 and timestamp string
+
+A `query_pg_f64` call against real `multical` must return a plausible temperature and a non-empty RFC3339 timestamp string.
+
+This proves the new PG transport produces the same `(f64, String)` tuple shape as the old Flux CSV parser.
+
+### INSERT includes explicit time column
+
+After `write_dhw_to_pg`, the transaction-local `dhw` row must have a `time` value within the last few seconds, proving the `now()` timestamp is written explicitly rather than relying on server-side defaults.
+
+### INSERT column types match dhw table schema
+
+After `write_dhw_to_pg`, all nine columns of the transaction-local `dhw` row must decode to their expected Rust types (TIMESTAMPTZ, FLOAT8, INTEGER, TEXT, BOOLEAN) with values matching the input `DhwState`.
+
+### Consecutive writes produce distinct rows
+
+Two `write_dhw_to_pg` calls with different state must each produce distinct rows in the transaction view of `dhw`.
+
+This proves `now()` is sufficiently unique for the single-writer service model, and both rows must be readable with correct values before rollback.
+
+### End-to-end read and write against seeded tables
+
+All three tables (`multical`, `dhw`, `dhw_capacity`) must be readable via `query_pg_f64`, and a transaction-local `write_dhw_to_pg` followed by a read-back must round-trip the `remaining_litres` value exactly without persisting the test row.

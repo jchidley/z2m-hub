@@ -32,9 +32,9 @@ Key shared state is:
 
 The DHW loop now keeps more of its state transitions in small pure helpers such as charge completion and draw tracking, so the async polling shell stays thin while the high-value litre/temperature rules are unit-testable in isolation.
 
-Some interface glue also uses small pure helpers for deterministic parsing and response shaping, such as Influx CSV extraction and heating-proxy JSON wrapping, so the LAN client shells remain thin and auditable without introducing subprocesses or duplicate policy logic.
+Some interface glue also uses small pure helpers for deterministic parsing and response shaping, such as heating-proxy JSON wrapping, so the LAN client shells remain thin and auditable without introducing subprocesses or duplicate policy logic.
 
-The InfluxDB persistence layer also follows this pattern: [[src/main.rs#format_dhw_line_protocol]] builds the write payload, [[src/main.rs#apply_autoload]] decides startup capacity upgrades, and [[src/main.rs#reconstruct_volume_at_reset]] recovers volume-register state on restart. These are the golden-reference functions for the [[postgres-migration]] to TimescaleDB.
+The PostgreSQL persistence layer also follows this pattern: `ReconnectingPg` is the thin runtime seam that connects on demand, [[src/main.rs#query_pg_f64]] handles all read queries with zero-default fallback, [[src/main.rs#write_dhw_to_pg]] handles fire-and-forget writes, [[src/main.rs#apply_autoload]] decides startup capacity upgrades, and [[src/main.rs#reconstruct_volume_at_reset]] recovers volume-register state on restart.
 
 The design assumes low enough contention that coarse mutexes are acceptable.
 

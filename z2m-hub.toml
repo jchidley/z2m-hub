@@ -16,8 +16,18 @@ draw_flow_min = 100.0
 # Crossover gap thresholds (°C)
 gap_sharp = 3.5
 gap_dissolved = 1.5
-# Sane range for autoloaded full_litres from InfluxDB
+# Sane range for autoloaded full_litres from database
 full_litres_min = 160.0
 full_litres_max = 220.0
 # WWHR adjustment is calculated by dhw-inflection-detector.py and
-# written to InfluxDB (dhw_capacity measurement). z2m-hub reads it on startup.
+# written to the database (dhw_capacity table). z2m-hub reads it on startup.
+
+[database]
+# PostgreSQL connection (TimescaleDB on pi5data)
+host = "10.0.1.230"
+port = 5432
+dbname = "energy"
+user = "energy"
+# Password resolved at runtime (no secrets in this file):
+# 1. systemd credential: $CREDENTIALS_DIRECTORY/pgpassword (production)
+# 2. PGPASSWORD env var: PGPASSWORD=$(ak get timescaledb) cargo run (dev)
