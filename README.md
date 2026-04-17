@@ -36,6 +36,8 @@ open http://10.0.1.230:3030
   - [Operational constraints](lat.md/constraints.md)
 - [`AGENTS.md`](AGENTS.md) — agent workflow, commands, and repo-specific execution rules
 
+For Symphony-style agent runs, use an isolated issue workspace instead of the main checkout.
+
 When docs and code disagree, code wins. When multiple docs could carry the same current-state fact, prefer `lat.md/` as the authoritative home.
 
 ## About This Code
