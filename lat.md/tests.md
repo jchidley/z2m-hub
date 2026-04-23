@@ -398,6 +398,10 @@ While charging is active, `hwc_now >= t1_at_charge_start` must mark crossover ac
 
 Once a charging cycle has already marked crossover achieved, later charging ticks below the threshold must not clear the crossover flag or demote the state back to `charging_below` before charge completion.
 
+### Steady charging without draw or completion does not request persistence
+
+While charging continues with no charge-end transition and no draw-volume advance, the live-tick helper must keep the in-memory charging state up to date without requesting a PostgreSQL write.
+
 ### Charge end resets volume and requests a write
 
 When a live tick sees charging transition to idle, it must run charge completion, reset `volume_at_reset` to the current Multical register, clear any stale Hwc crash flag, and request persistence.

@@ -3423,6 +3423,37 @@ gap_dissolved = 2.0
         assert!(s.was_charging);
     }
 
+    // @lat: [[tests#DHW loop orchestration#Steady charging without draw or completion does not request persistence]]
+    #[test]
+    fn live_tick_steady_charging_without_draw_or_completion_does_not_request_persistence() {
+        let cfg = test_cfg();
+        let mut s = test_state();
+        s.was_charging = true;
+        s.crossover_achieved = false;
+        s.charge_state = DhwChargeState::ChargingBelow;
+        s.t1_at_charge_start = 45.0;
+        s.volume_at_reset = 1000.0;
+        s.remaining = 150.0;
+
+        let should_write = apply_live_dhw_tick(
+            &mut s,
+            &cfg,
+            LiveDhwTick {
+                charging: true,
+                volume_now: 1000.0,
+                t1_now: 46.5,
+                hwc_now: 44.0,
+                dhw_flow: 0.0,
+            },
+        );
+
+        assert!(!should_write);
+        assert!(s.was_charging);
+        assert_eq!(s.charge_state, DhwChargeState::ChargingBelow);
+        assert_eq!(s.remaining, 150.0);
+        assert_eq!(s.volume_at_reset, 1000.0);
+    }
+
     // @lat: [[tests#DHW loop orchestration#Charge end resets volume and requests a write]]
     #[test]
     fn live_tick_charge_end_resets_volume_and_requests_a_write() {
