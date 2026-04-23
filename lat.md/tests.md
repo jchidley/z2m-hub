@@ -522,6 +522,12 @@ The thin PostgreSQL polling helpers must select the intended `multical` columns 
 
 When PostgreSQL has no recent row for volume, T1, or flow, each polling helper must still return `0.0` via the shared query fallback contract.
 
+### Latest Multical timestamp falls back to the last historical row
+
+When the recent-window Multical helpers return no row, the stale/unknown path must still recover the latest historical Multical timestamp.
+
+This lets the UI say when telemetry last existed rather than only saying it is unavailable.
+
 ## eBUS interface
 
 These specs cover the small parsing rules z2m-hub applies to ebusd text responses before combining them with sensor data.

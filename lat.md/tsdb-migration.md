@@ -20,12 +20,13 @@ Current PostgreSQL-first behaviour lives in:
 The z2m-hub service migration is complete even though the shared platform migration still has final cleanup work.
 
 Repo-local closeout evidence:
-- `z2m-hub` is still the original PostgreSQL cutover process on `pi5data` (`ExecMainPID=804858`, `ActiveEnterTimestamp=Sun 2026-04-12 12:05:26 BST`, `SubState=running`)
-- `/api/hot-water`, `/api/dhw/status`, and `/api/lights` returned sane JSON during the final review
-- the journal closeout grep showed normal PostgreSQL startup and no restart churn
+- `z2m-hub` is running on `pi5data` from the latest hardening deploy (`ExecMainPID=2687130`, `ActiveEnterTimestamp=Thu 2026-04-23 10:05:52 BST`, `SubState=running`)
+- `/api/hot-water`, `/api/dhw/status`, and `/api/lights` returned sane JSON during the latest review
+- `/api/hot-water` now explicitly reports stale Multical telemetry as `multical_stale = true` with `null`/`unknown` hot-water fields rather than presenting persisted litres as if they were live
+- the journal closeout grep showed the expected startup plus the new "startup recovery deferred until fresh telemetry returns" warning when Multical was stale
 - recent `dhw` rows were still present in PostgreSQL/TimescaleDB
 - the rollback binary `/usr/local/bin/z2m-hub.pre-pg-rollback.bak` was still present and non-empty (`7.3M`)
-- the phone-sized dashboard behaviour was explicitly accepted
+- the phone-sized dashboard behaviour was explicitly accepted, including the distinct unknown-water rendering
 
 ## Remaining shared migration actions
 
@@ -95,10 +96,12 @@ No further repo-local parity work is required unless the shared migration uncove
 The live PostgreSQL cutover still looks stable from the repo side.
 
 Latest re-check during this review:
-- service status still shows the original cutover start time on `pi5data` (`ExecMainPID=804858`, `ActiveEnterTimestamp=Sun 2026-04-12 12:05:26 BST`, `SubState=running`)
-- closeout grep returned only the expected PostgreSQL connect log line from cutover, with no repeated credential/runtime failures
-- live API checks returned sane `{"ok":true}` payloads for `/api/hot-water`, `/api/dhw/status`, and `/api/lights`
-- recent `dhw` rows were still present in PostgreSQL/TimescaleDB, with the latest row at `2026-04-13 06:30:52.332111+00`
+- service status shows the current hardening deploy on `pi5data` (`ExecMainPID=2687130`, `ActiveEnterTimestamp=Thu 2026-04-23 10:05:52 BST`, `SubState=running`)
+- closeout grep showed the expected startup plus `DHW init: Multical snapshot stale; startup recovery deferred until fresh volume/T1 telemetry returns`, with no restart churn
+- live API checks returned sane payloads for `/api/hot-water`, `/api/dhw/status`, and `/api/lights`
+- `/api/hot-water` currently returns `multical_stale = true`, `remaining_litres = null`, `charge_state = "unknown"`, and still-live `hwc_storage = 32.5`, which is the intended stale/unknown contract while the Multical feed is missing
+- recent `dhw` rows were still present in PostgreSQL/TimescaleDB, with the latest row at `2026-04-23 08:52:49.577073+00`
+- latest historical `multical` row in PostgreSQL remained `2026-04-16 10:08:50+00`, confirming the app is surfacing a real upstream telemetry gap rather than masking it
 - rollback artifact remained available at `/usr/local/bin/z2m-hub.pre-pg-rollback.bak` (`7.3M`)
 
 ## Verification commands
@@ -123,7 +126,7 @@ ssh jack@pi5data 'sudo journalctl -u z2m-hub --since "2026-04-12 12:05:00" --no-
 
 ### Live API spot checks
 
-Confirm the API surface still returns sane hot-water, DHW-status, and lights payloads.
+Confirm the API surface still returns sane hot-water, DHW-status, and lights payloads. During a Multical outage, `/api/hot-water` should now show the explicit stale/unknown contract rather than fake live litres.
 
 ```bash
 ssh jack@pi5data '

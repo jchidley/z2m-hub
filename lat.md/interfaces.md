@@ -21,6 +21,8 @@ Key endpoints are:
 
 The light toggle API is optimistic: it returns the intended new state before Zigbee2MQTT confirms the device state.
 
+`GET /api/hot-water` now has an explicit stale/unknown branch. When the required Multical-backed volume/T1 snapshot is fresh, it returns the live DHW estimate fields. When that telemetry is stale or missing, it returns `multical_stale = true`, preserves still-live eBUS-backed `hwc_storage`, switches `charge_state` to `"unknown"`, nulls the Multical-derived fields (`remaining_litres`, `effective_t1`, `t1`, `crossover_achieved`), and carries the latest known Multical timestamp when one can still be found in PostgreSQL history.
+
 ## Zigbee2MQTT WebSocket protocol
 
 Zigbee device control uses the Zigbee2MQTT WebSocket API at `ws://emonpi:8080/api`.
@@ -37,7 +39,7 @@ The server writes `command + "\n"`, shuts down the write side, and reads until E
 
 TimescaleDB on `10.0.1.230:5432` is both the source of DHW telemetry and the persistence layer for the current estimate.
 
-The service queries `multical`, `dhw`, and `dhw_capacity` tables via `tokio-postgres`, using `ORDER BY time DESC LIMIT 1` for last-value semantics. Reads return `(f64, String)` with a `(0.0, "")` zero-default on any error. Writes INSERT into the `dhw` table with an explicit `now()` timestamp, with a pure `dhw_write_row` helper mapping `DhwState` into the eight typed payload columns before the SQL call. The runtime PostgreSQL seam connects on demand per read/write operation rather than holding one long-lived shared client, so startup does not fail just because TimescaleDB is briefly unavailable and later calls naturally retry after a disconnect. The code depends on the shared TimescaleDB schema column naming and on the Multical volume register staying monotonic.
+The service queries `multical`, `dhw`, and `dhw_capacity` tables via `tokio-postgres`, using `ORDER BY time DESC LIMIT 1` for last-value semantics. Reads return `(f64, String)` with a `(0.0, "")` zero-default on any error. The DHW stale/unknown path also queries the latest historical Multical row without a recency window when it needs a last-known timestamp for the dashboard stale notice. Writes INSERT into the `dhw` table with an explicit `now()` timestamp, with a pure `dhw_write_row` helper mapping `DhwState` into the eight typed payload columns before the SQL call. The runtime PostgreSQL seam connects on demand per read/write operation rather than holding one long-lived shared client, so startup does not fail just because TimescaleDB is briefly unavailable and later calls naturally retry after a disconnect. The code depends on the shared TimescaleDB schema column naming and on the Multical volume register staying monotonic.
 
 **TimescaleDB hypertable constraint:** the `dhw` table is a hypertable partitioned by `time`. TimescaleDB does not support unique constraints on the partitioning column alone, so `ON CONFLICT (time)` is not available. The write path uses plain INSERT — duplicate timestamps are impossible in practice because `now()` is evaluated server-side for each single-writer call.
 

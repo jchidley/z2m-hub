@@ -1200,6 +1200,15 @@ async fn get_current_dhw_flow(pg: &dyn PgAccess) -> (f64, String) {
     .await
 }
 
+async fn get_latest_multical_timestamp(pg: &dyn PgAccess) -> String {
+    pg.query_f64(
+        "SELECT dhw_volume_v1, time FROM multical \
+         ORDER BY time DESC LIMIT 1",
+    )
+    .await
+    .1
+}
+
 fn latest_multical_timestamp(timestamps: [&str; 3]) -> String {
     timestamps
         .into_iter()
@@ -1576,6 +1585,11 @@ async fn dhw_tracking_loop(
         let charging = is_charging().await;
         let (t1, t1_ts) = get_current_t1(pg.as_ref()).await;
         let (dhw_flow, flow_ts) = get_current_dhw_flow(pg.as_ref()).await;
+        let fallback_multical_ts = if volume_ts.is_empty() && t1_ts.is_empty() && flow_ts.is_empty() {
+            get_latest_multical_timestamp(pg.as_ref()).await
+        } else {
+            String::new()
+        };
         let hwc = get_hwc_storage_temp().await;
 
         let mut s = state.lock().await;
@@ -1583,6 +1597,9 @@ async fn dhw_tracking_loop(
         s.current_hwc = hwc;
         s.was_charging = charging;
         update_multical_status(&mut s, &volume_ts, &t1_ts, &flow_ts);
+        if s.multical_timestamp.is_empty() {
+            s.multical_timestamp = fallback_multical_ts;
+        }
         if s.multical_stale {
             s.startup_recovery_pending = true;
             warn!(
@@ -1608,6 +1625,11 @@ async fn dhw_tracking_loop(
         let (t1_now, t1_ts) = get_current_t1(pg.as_ref()).await;
         let hwc_now = get_hwc_storage_temp().await;
         let (dhw_flow, flow_ts) = get_current_dhw_flow(pg.as_ref()).await;
+        let fallback_multical_ts = if volume_ts.is_empty() && t1_ts.is_empty() && flow_ts.is_empty() {
+            get_latest_multical_timestamp(pg.as_ref()).await
+        } else {
+            String::new()
+        };
         let tick = LiveDhwTick {
             charging,
             volume_now,
@@ -1618,6 +1640,9 @@ async fn dhw_tracking_loop(
 
         let mut s = state.lock().await;
         update_multical_status(&mut s, &volume_ts, &t1_ts, &flow_ts);
+        if s.multical_timestamp.is_empty() {
+            s.multical_timestamp = fallback_multical_ts;
+        }
         let should_write = if s.multical_stale {
             s.current_hwc = hwc_now;
             false
@@ -3176,6 +3201,22 @@ gap_dissolved = 2.0
         assert_eq!(get_current_volume(&fake_pg).await, (0.0, String::new()));
         assert_eq!(get_current_t1(&fake_pg).await, (0.0, String::new()));
         assert_eq!(get_current_dhw_flow(&fake_pg).await, (0.0, String::new()));
+    }
+
+    // @lat: [[tests#PostgreSQL interface#Latest Multical timestamp falls back to the last historical row]]
+    #[tokio::test]
+    async fn latest_multical_timestamp_falls_back_to_the_last_historical_row() {
+        let fake_pg = FakePg::default().with_query_result(
+            "SELECT dhw_volume_v1, time FROM multical \
+             ORDER BY time DESC LIMIT 1",
+            104089.99,
+            "2026-04-16T10:08:50Z",
+        );
+
+        assert_eq!(
+            get_latest_multical_timestamp(&fake_pg).await,
+            "2026-04-16T10:08:50Z"
+        );
     }
 
     // @lat: [[tests#PostgreSQL interface#Write failure does not stop the caller]]
