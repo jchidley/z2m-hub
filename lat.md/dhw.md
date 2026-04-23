@@ -10,7 +10,7 @@ z2m-hub estimates remaining usable hot water by combining ebusd state, PostgreSQ
 
 The DHW loop polls all required signals every 10 seconds.
 
-The model reads charge state from eBUS, `HwcStorageTemp` from eBUS, and T1, draw flow, and cumulative volume from PostgreSQL. If the required Multical-backed volume/T1 snapshot is missing, the service marks the hot-water view as stale/unknown instead of presenting persisted litres as if they were live. The shared state for this model lives in `DhwState`, while the highest-value state transitions now sit in small pure charge-completion and draw-tracking helpers that the loop calls after polling.
+The model reads charge state from eBUS, `HwcStorageTemp` from eBUS, and T1, draw flow, and cumulative volume from PostgreSQL. If the required Multical-backed volume/T1 snapshot is missing, the service marks the hot-water view as stale/unknown instead of presenting persisted litres as if they were live. The dashboard renders that state distinctly rather than as an empty tank so operators can tell the difference between "unknown" and genuinely exhausted hot water. The shared state for this model lives in `DhwState`, while the highest-value state transitions now sit in small pure charge-completion and draw-tracking helpers that the loop calls after polling.
 
 ## Charge detection
 

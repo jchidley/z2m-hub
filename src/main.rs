@@ -728,6 +728,16 @@ const HOME_PAGE: &str = r#"<!DOCTYPE html>
   .water.warm {
     background: linear-gradient(to top, #cc8800, #ffaa33);
   }
+  .water.unknown {
+    background:
+      repeating-linear-gradient(
+        -45deg,
+        rgba(255, 210, 120, 0.95) 0px,
+        rgba(255, 210, 120, 0.95) 10px,
+        rgba(180, 90, 0, 0.95) 10px,
+        rgba(180, 90, 0, 0.95) 20px
+      );
+  }
   .hw-info { display: flex; flex-direction: column; }
   .litres { font-size: 40px; font-weight: 700; }
   .hw-label { font-size: 14px; color: #999; }
@@ -736,6 +746,7 @@ const HOME_PAGE: &str = r#"<!DOCTYPE html>
   .hw-status.low { color: #ffaa00; }
   .hw-status.ok { color: #44cc44; }
   .hw-status.full { color: #ff4433; }
+  .hw-status.unknown { color: #ffbf66; }
   .hw-updated { font-size: 11px; color: #666; margin-top: 2px; }
 
   /* Lights */
@@ -903,12 +914,14 @@ async function updateHotWater() {
     const waterEl = document.getElementById('water');
     const el = document.getElementById('hw-status');
 
+    waterEl.classList.remove('cool', 'warm', 'unknown');
+
     if (d.multical_stale) {
-      litresEl.textContent = '—';
-      waterEl.style.height = '0%';
-      waterEl.classList.remove('cool', 'warm');
+      litresEl.textContent = '?';
+      waterEl.style.height = '100%';
+      waterEl.classList.add('unknown');
       el.textContent = 'Unknown';
-      el.className = 'hw-status low';
+      el.className = 'hw-status unknown';
       if (d.timestamp) {
         const t = new Date(d.timestamp);
         updatedEl.textContent = 'Multical stale since ' + t.toLocaleString();
@@ -924,7 +937,6 @@ async function updateHotWater() {
     waterEl.style.height = pct + '%';
     // Colour by effective temperature: hot (≥42) → warm (38–42) → cool (<38)
     const et = d.effective_t1 || 0;
-    waterEl.classList.remove('cool', 'warm');
     if (et > 0 && et < 38) waterEl.classList.add('cool');
     else if (et >= 38 && et < 42) waterEl.classList.add('warm');
     const cs = d.charge_state || '';
