@@ -41,11 +41,15 @@ Open actions that still affect migration completion:
 4. pi5data Phase 5: stop and remove the InfluxDB v2 container.
 5. pi5data Phase 5: archive the v2 data volume.
 
+The shared tracker in `~/github/energy-hub/lat.md/tsdb-migration.md` still shows the same gate: Phase 5 stays blocked on `heatpump-analysis` final parity / rollback sign-off, and the destructive cutover sequence itself belongs to `~/github/energy-hub/docs/timescaledb-cutover-runbook.md`.
+
 z2m-hub has no remaining repo-local runtime dependency on InfluxDB. The remaining migration blockers are shared-platform completion plus the last external consumer (`heatpump-analysis`).
 
 ### Reviewed remaining Influx-only information in z2m-hub lat
 
-A repo-wide grep for `influx` / `InfluxDB` now finds only `lat.md/tsdb-migration.md`, `lat.md/infrastructure.md`, and the `[[tsdb-migration]]` backlink in `lat.md/lat.md`.
+A tracked-file grep for `influx` / `InfluxDB` now finds only `lat.md/tsdb-migration.md`, `lat.md/infrastructure.md`, and the `[[tsdb-migration]]` backlink in `lat.md/lat.md`.
+
+That review also confirmed there is no remaining repo-local Influx-only behaviour or operator guidance hiding in `src/`, `README.md`, `AGENTS.md`, or `z2m-hub.toml`; the only still-relevant Influx-era information is either the historical closeout evidence in this file or shared Phase 5 operator context owned by `energy-hub`.
 
 | Location | Why it still exists | Required plan action |
 |---|---|---|
@@ -55,7 +59,7 @@ A repo-wide grep for `influx` / `InfluxDB` now finds only `lat.md/tsdb-migration
 | `pi5data:/usr/local/bin/z2m-hub.pre-pg-rollback.bak` | preserves the last pre-PostgreSQL rollback binary during the shared rollback window | remove after Phase 5 sign-off and explicit rollback-window close |
 | this file | acts as the repo-local closeout note while the shared migration is still open | retire or reduce to a backlink after shared closeout |
 
-No other repo-local lat sections describe InfluxDB as current runtime behaviour. No additional repo-local migration blocker was found beyond the shared Phase 5 work, the existing rollback-window cleanup, and the post-Phase-5 doc cleanup now called out below.
+No other repo-local lat sections describe InfluxDB as current runtime behaviour. No additional repo-local migration blocker was found beyond the shared Phase 5 work, the existing rollback-window cleanup, the shared `energy-hub` runbook/tracker context above, and the post-Phase-5 doc cleanup now called out below.
 
 ### Reviewed repo-local Influx-shaped artifacts
 
