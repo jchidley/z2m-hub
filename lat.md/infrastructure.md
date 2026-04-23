@@ -10,12 +10,12 @@ z2m-hub runs on the LAN as a Raspberry Pi service and depends on neighbouring ho
 
 The deployed system spans a few fixed LAN nodes with clear ownership boundaries.
 
-- `pi5data` (`10.0.1.230`) runs z2m-hub (systemd service), plus Docker containers: TimescaleDB (`timescale/timescaledb:latest-pg17`), Grafana, Telegraf, Mosquitto, and ebusd
+- `pi5data` (`10.0.1.230`) runs z2m-hub (systemd service), plus Docker containers: TimescaleDB (`timescale/timescaledb:latest-pg17`), Grafana, Mosquitto, and ebusd
 - `emonpi` (`10.0.1.117`) runs Zigbee2MQTT and the Zigbee coordinator
 - `emondhw` (`10.0.1.46`) publishes Multical DHW heat-meter data
 - the router provides local DNS and DHCP under the `chidley.home` domain
 
-The desired steady state is PostgreSQL-first. If an InfluxDB v2 container still exists on `pi5data`, treat it as a temporary migration artefact rather than part of the target architecture; its retirement is tracked in [[tsdb-migration]].
+The desired steady state is PostgreSQL-first, and that is now the live state on `pi5data` after the 2026-04-23 shutdown of the legacy InfluxDB v2 path.
 
 The dashboard is intended to be reached as `http://10.0.1.230:3030` because some Android clients do not append the LAN search domain reliably.
 

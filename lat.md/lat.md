@@ -13,7 +13,7 @@ This graph is the source of truth for current architecture, domain rules, and li
 - [[infrastructure]] records hosts, config ownership, and deployment shape.
 - [[constraints]] captures hard boundaries that should guide code changes.
 - [[tests]] records durable test specs and `@lat:` traceability anchors for high-value invariants.
-- [[tsdb-migration]] records the current migration state, the remaining shared completion work, and the repo-local backlog after migration.
+- [[tsdb-migration]] records the migration completion note and any remaining repo-local cleanup backlog.
 
 ## Reading order
 
