@@ -1235,27 +1235,31 @@ where
 }
 
 /// Apply standby decay: T1 drops at configured rate, mark standby below reduced_t1
+fn apply_standby_decay_for_elapsed_hours(s: &mut DhwState, cfg: &DhwConfig, hours: f64) {
+    s.effective_t1 = s.t1_at_charge_end - cfg.t1_decay_rate * hours;
+
+    let charging_active = matches!(
+        s.charge_state,
+        DhwChargeState::ChargingBelow | DhwChargeState::ChargingUniform
+    );
+
+    // Below reduced_t1, don't reduce remaining — the water is still there,
+    // just lukewarm. The SPA shows colour (blue/amber/red) for temperature.
+    // Only mark as standby once charging is no longer active.
+    if !charging_active && s.effective_t1 < cfg.reduced_t1 {
+        s.charge_state = DhwChargeState::Standby;
+    }
+
+    // Mark as standby after 2h.
+    if !charging_active && hours >= 2.0 {
+        s.charge_state = DhwChargeState::Standby;
+    }
+}
+
 fn apply_standby_decay(s: &mut DhwState, cfg: &DhwConfig) {
     if let Some(end_time) = s.charge_end_time {
         let hours = end_time.elapsed().as_secs_f64() / 3600.0;
-        s.effective_t1 = s.t1_at_charge_end - cfg.t1_decay_rate * hours;
-
-        // Below reduced_t1, don't reduce remaining — the water is still there,
-        // just lukewarm. The SPA shows colour (blue/amber/red) for temperature.
-        // Only mark as standby.
-        if s.effective_t1 < cfg.reduced_t1 {
-            s.charge_state = DhwChargeState::Standby;
-        }
-
-        // Mark as standby after 2h
-        if hours > 2.0
-            && !matches!(
-                s.charge_state,
-                DhwChargeState::ChargingBelow | DhwChargeState::ChargingUniform
-            )
-        {
-            s.charge_state = DhwChargeState::Standby;
-        }
+        apply_standby_decay_for_elapsed_hours(s, cfg, hours);
     }
 }
 
@@ -2040,6 +2044,15 @@ mod tests {
             response::IntoResponse,
         };
 
+        let invalid_json_response = || {
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "application/json")
+                .body(Body::from("not-json"))
+                .expect("build invalid json response")
+                .into_response()
+        };
+
         let app = axum::Router::new()
             .route(
                 "/status",
@@ -2052,12 +2065,7 @@ mod tests {
                                 .lock()
                                 .expect("recorded requests mutex")
                                 .push(("GET /status".to_string(), None));
-                            Response::builder()
-                                .status(StatusCode::OK)
-                                .header("content-type", "application/json")
-                                .body(Body::from("not-json"))
-                                .expect("build invalid json response")
-                                .into_response()
+                            invalid_json_response()
                         }
                     }
                 }),
@@ -2073,12 +2081,39 @@ mod tests {
                                 .lock()
                                 .expect("recorded requests mutex")
                                 .push((format!("POST /mode/{mode}"), None));
-                            Response::builder()
-                                .status(StatusCode::OK)
-                                .header("content-type", "application/json")
-                                .body(Body::from("not-json"))
-                                .expect("build invalid json response")
-                                .into_response()
+                            invalid_json_response()
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/kill",
+                axum::routing::post({
+                    let requests = requests.clone();
+                    move || {
+                        let requests = requests.clone();
+                        async move {
+                            requests
+                                .lock()
+                                .expect("recorded requests mutex")
+                                .push(("POST /kill".to_string(), None));
+                            invalid_json_response()
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/mode/away",
+                axum::routing::post({
+                    let requests = requests.clone();
+                    move |Json(body): Json<serde_json::Value>| {
+                        let requests = requests.clone();
+                        async move {
+                            requests
+                                .lock()
+                                .expect("recorded requests mutex")
+                                .push(("POST /mode/away".to_string(), Some(body)));
+                            invalid_json_response()
                         }
                     }
                 }),
@@ -2125,6 +2160,42 @@ mod tests {
                     .expect("write ebusd response");
             }
         })
+    }
+
+    async fn spawn_ebusd_observing_server(
+        response: &'static str,
+    ) -> (
+        tokio::task::JoinHandle<Vec<u8>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 8888))
+            .await
+            .expect("bind observing ebusd test server");
+
+        let server = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+            let (mut stream, _) = listener.accept().await.expect("accept observing ebusd client");
+            let mut raw = Vec::new();
+            stream
+                .read_to_end(&mut raw)
+                .await
+                .expect("read observing ebusd command to eof");
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write observing ebusd response");
+            raw
+        });
+
+        let client = tokio::spawn(async move {
+            let reply = ebusd_command("read -f -c 700 HwcStorageTemp")
+                .await
+                .expect("ebusd_command reply");
+            assert_eq!(reply, "done");
+        });
+
+        (server, client)
     }
 
     // ── apply_no_crossover_charge tests ─────────────────────────────────
@@ -2387,6 +2458,64 @@ mod tests {
         assert!(s.hwc_crash_detected);
     }
 
+    // @lat: [[tests#DHW draw tracking#Hwc storage crash sets detected flag when remaining already within cap]]
+    #[test]
+    fn draw_tracking_hwc_crash_sets_flag_when_remaining_already_within_cap() {
+        let cfg = test_cfg();
+        let mut s = test_state();
+        s.full_litres = 177.0;
+        s.remaining = 100.0; // already < vol_above_hwc (148.0)
+        s.volume_at_reset = 1000.0;
+        s.drawing = true;
+        s.hwc_pre_draw = 50.0;
+        s.hwc_crash_detected = false;
+        s.t1_pre_draw = 50.0;
+
+        // hwc_drop = 50.0 - 44.0 = 6.0 > 5.0 → crash fires for first time
+        apply_draw_tracking(&mut s, &cfg, 1010.0, 49.8, 44.0);
+
+        assert!(s.hwc_crash_detected, "crash flag must be armed");
+        // remaining was 100.0 → volume draw reduces by 10L → 100.0.min(167.0) = 100.0
+        // crash fires but remaining (100.0) is already below cap (148.0), so no change
+        assert_eq!(s.remaining, 100.0, "remaining must not be raised to cap when already within it");
+    }
+
+    // @lat: [[tests#DHW draw tracking#Severe T1 drop is idempotent when remaining is already zero]]
+    #[test]
+    fn draw_tracking_severe_t1_drop_is_idempotent_when_remaining_already_zero() {
+        let cfg = test_cfg();
+        let mut s = test_state();
+        s.full_litres = 177.0;
+        s.remaining = 0.0;
+        s.volume_at_reset = 1000.0;
+        s.drawing = true;
+        s.hwc_pre_draw = 48.0;
+        s.t1_pre_draw = 50.0;
+
+        // t1_drop = 50.0 - 47.9 = 2.1 > 1.5 → severe
+        apply_draw_tracking(&mut s, &cfg, 1010.0, 47.9, 47.5);
+
+        assert_eq!(s.remaining, 0.0, "remaining must stay at zero");
+    }
+
+    // @lat: [[tests#DHW draw tracking#Moderate T1 drop does not raise remaining when already below twenty litres]]
+    #[test]
+    fn draw_tracking_moderate_t1_drop_does_not_raise_remaining_when_already_below_cap() {
+        let cfg = test_cfg();
+        let mut s = test_state();
+        s.full_litres = 177.0;
+        s.remaining = 15.0; // already below 20L cap
+        s.volume_at_reset = 1000.0;
+        s.drawing = true;
+        s.hwc_pre_draw = 48.0;
+        s.t1_pre_draw = 50.0;
+
+        // t1_drop = 50.0 - 49.0 = 1.0, > 0.5 and <= 1.5 → moderate
+        apply_draw_tracking(&mut s, &cfg, 1010.0, 49.0, 47.5);
+
+        assert_eq!(s.remaining, 15.0, "remaining must not be raised by the 20L cap");
+    }
+
     // ── apply_standby_decay tests ───────────────────────────────────────
 
     // @lat: [[tests#DHW standby decay#No charge end time leaves state unchanged]]
@@ -2406,20 +2535,15 @@ mod tests {
 
     // @lat: [[tests#DHW standby decay#Two hour decay cools top temperature and marks standby]]
     #[test]
-    fn standby_decay_reduces_effective_t1() {
+    fn standby_decay_at_exact_two_hours_marks_standby() {
         let cfg = test_cfg();
         let mut s = test_state();
-        // Simulate charge ended 2 hours ago
-        s.charge_end_time = Some(Instant::now() - Duration::from_secs(7200));
         s.t1_at_charge_end = 50.0;
         s.charge_state = DhwChargeState::Full;
 
-        apply_standby_decay(&mut s, &cfg);
+        apply_standby_decay_for_elapsed_hours(&mut s, &cfg, 2.0);
 
-        // effective_t1 = 50 - 0.25 * 2 = 49.5 (approximately)
-        assert!(s.effective_t1 < 50.0);
-        assert!(s.effective_t1 > 49.0);
-        // After 2h, should transition to Standby
+        assert_eq!(s.effective_t1, 49.5);
         assert_eq!(s.charge_state, DhwChargeState::Standby);
     }
 
@@ -2459,21 +2583,29 @@ mod tests {
 
     // @lat: [[tests#DHW standby decay#Decay never overwrites active charging states]]
     #[test]
-    fn standby_decay_does_not_override_charging_state() {
+    fn standby_decay_does_not_override_charging_state_after_two_hours() {
         let cfg = test_cfg();
         let mut s = test_state();
-        s.charge_end_time = Some(Instant::now() - Duration::from_secs(3600 * 3));
         s.t1_at_charge_end = 50.0;
         s.charge_state = DhwChargeState::ChargingBelow;
 
-        apply_standby_decay(&mut s, &cfg);
+        apply_standby_decay_for_elapsed_hours(&mut s, &cfg, 3.0);
 
-        // >2h but charging state should be preserved by the second condition
-        // Wait — the code checks: if hours > 2.0 && !matches!(charging states)
-        // ChargingBelow IS matched, so the 2h rule doesn't apply
-        // But the reduced_t1 check at 49.25 > 42 doesn't trigger either
-        // So charging state should be preserved
+        assert_eq!(s.effective_t1, 49.25);
         assert_eq!(s.charge_state, DhwChargeState::ChargingBelow);
+    }
+
+    #[test]
+    fn standby_decay_below_reduced_t1_does_not_override_active_charging_state() {
+        let cfg = test_cfg();
+        let mut s = test_state();
+        s.t1_at_charge_end = 50.0;
+        s.charge_state = DhwChargeState::ChargingUniform;
+
+        apply_standby_decay_for_elapsed_hours(&mut s, &cfg, 40.0);
+
+        assert!(s.effective_t1 < cfg.reduced_t1);
+        assert_eq!(s.charge_state, DhwChargeState::ChargingUniform);
     }
 
     // ── Config and eBUS helper tests ─────────────────────────────────────
@@ -2613,6 +2745,27 @@ gap_dissolved = 2.0
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // @lat: [[tests#Password resolution#Missing systemd credential file falls back to PGPASSWORD]]
+    #[test]
+    fn missing_systemd_credential_file_falls_back_to_pgpassword() {
+        let dir = format!("/tmp/z2m-creds-missing-{}", std::process::id());
+        std::fs::create_dir_all(&dir).expect("create temp creds dir without credential file");
+
+        with_password_env(Some(&dir), Some("env-secret"), || {
+            let cfg = DatabaseConfig::default();
+            let pw = cfg.resolve_password();
+            assert_eq!(pw.as_deref(), Some("env-secret"));
+
+            let conn = cfg.to_connection_string();
+            assert!(
+                conn.contains("password=env-secret"),
+                "conn string must include env password fallback: {conn}"
+            );
+        });
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // @lat: [[tests#Password resolution#Connection string omits password when none resolved]]
     #[test]
     fn connection_string_omits_password_when_none_resolved() {
@@ -2655,9 +2808,40 @@ gap_dissolved = 2.0
         assert_eq!(return_temp, 0.0);
     }
 
+    // @lat: [[tests#eBUS interface#eBUS command sends one newline-terminated request and trims the reply]]
+    #[tokio::test]
+    async fn ebusd_command_sends_one_newline_terminated_request_and_trims_the_reply() {
+        let _guard = dhw_http_test_lock().lock().await;
+        let (server, client) = spawn_ebusd_observing_server("  done\n").await;
+
+        client.await.expect("ebusd observing client task");
+        let raw = server.await.expect("ebusd observing server task");
+
+        assert_eq!(raw, b"read -f -c 700 HwcStorageTemp\n");
+    }
+
+    // @lat: [[tests#eBUS interface#eBUS command closes the write side before waiting for the reply]]
+    #[tokio::test]
+    async fn ebusd_command_closes_the_write_side_before_waiting_for_the_reply() {
+        let _guard = dhw_http_test_lock().lock().await;
+        let (server, client) = spawn_ebusd_observing_server("done").await;
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), client)
+            .await
+            .expect("ebusd client should finish once server sees eof")
+            .expect("ebusd observing client task");
+        let raw = tokio::time::timeout(std::time::Duration::from_secs(1), server)
+            .await
+            .expect("ebusd server should finish once client half-closes")
+            .expect("ebusd observing server task");
+
+        assert_eq!(raw, b"read -f -c 700 HwcStorageTemp\n");
+    }
+
     // @lat: [[tests#eBUS interface#Hwc storage helper parses numeric replies and defaults to zero]]
     #[tokio::test]
     async fn hwc_storage_helper_parses_numeric_reply_and_defaults_to_zero() {
+        let _guard = dhw_http_test_lock().lock().await;
         let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
         let responses = Arc::new(std::collections::HashMap::from([(
             "read -f -c 700 HwcStorageTemp".to_string(),
@@ -2694,6 +2878,7 @@ gap_dissolved = 2.0
     // @lat: [[tests#eBUS interface#Charging helper treats either sfmode load or Status01 hwc as charging]]
     #[tokio::test]
     async fn charging_helper_treats_either_sfmode_load_or_status01_hwc_as_charging() {
+        let _guard = dhw_http_test_lock().lock().await;
         let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
         let responses = Arc::new(std::collections::HashMap::from([
             (
@@ -3019,6 +3204,94 @@ gap_dissolved = 2.0
         assert_eq!(s.charge_state, DhwChargeState::ChargingBelow);
     }
 
+    // @lat: [[tests#DHW loop orchestration#Charge start captures T1 baseline and resets crossover tracking]]
+    #[test]
+    fn live_tick_charge_start_captures_t1_baseline_and_resets_crossover_tracking() {
+        let cfg = test_cfg();
+        let mut s = test_state();
+        s.was_charging = false;
+        s.crossover_achieved = true;
+        s.charge_state = DhwChargeState::Standby;
+        s.t1_at_charge_start = 0.0;
+        s.volume_at_reset = 1000.0;
+
+        let should_write = apply_live_dhw_tick(
+            &mut s,
+            &cfg,
+            LiveDhwTick {
+                charging: true,
+                volume_now: 1000.0,
+                t1_now: 46.5,
+                hwc_now: 42.0,
+                dhw_flow: 0.0,
+            },
+        );
+
+        assert!(!should_write);
+        assert_eq!(s.t1_at_charge_start, 46.5);
+        assert!(!s.crossover_achieved);
+        assert_eq!(s.charge_state, DhwChargeState::ChargingBelow);
+        assert!(s.was_charging);
+    }
+
+    // @lat: [[tests#DHW loop orchestration#Crossover at the charge start threshold promotes uniform charging]]
+    #[test]
+    fn live_tick_crossover_at_charge_start_threshold_promotes_uniform_charging() {
+        let cfg = test_cfg();
+        let mut s = test_state();
+        s.was_charging = true;
+        s.crossover_achieved = false;
+        s.charge_state = DhwChargeState::ChargingBelow;
+        s.t1_at_charge_start = 45.0;
+        s.volume_at_reset = 1000.0;
+
+        let should_write = apply_live_dhw_tick(
+            &mut s,
+            &cfg,
+            LiveDhwTick {
+                charging: true,
+                volume_now: 1000.0,
+                t1_now: 47.0,
+                hwc_now: 45.0,
+                dhw_flow: 0.0,
+            },
+        );
+
+        assert!(!should_write);
+        assert!(s.crossover_achieved);
+        assert_eq!(s.charge_state, DhwChargeState::ChargingUniform);
+        assert!(s.was_charging);
+    }
+
+    // @lat: [[tests#DHW loop orchestration#Achieved crossover stays uniform for the rest of the charge]]
+    #[test]
+    fn live_tick_achieved_crossover_stays_uniform_for_the_rest_of_the_charge() {
+        let cfg = test_cfg();
+        let mut s = test_state();
+        s.was_charging = true;
+        s.crossover_achieved = true;
+        s.charge_state = DhwChargeState::ChargingUniform;
+        s.t1_at_charge_start = 45.0;
+        s.volume_at_reset = 1000.0;
+
+        let should_write = apply_live_dhw_tick(
+            &mut s,
+            &cfg,
+            LiveDhwTick {
+                charging: true,
+                volume_now: 1000.0,
+                t1_now: 46.0,
+                hwc_now: 43.0,
+                dhw_flow: 0.0,
+            },
+        );
+
+        assert!(!should_write);
+        assert!(s.crossover_achieved);
+        assert_eq!(s.charge_state, DhwChargeState::ChargingUniform);
+        assert!(s.was_charging);
+    }
+
     // @lat: [[tests#DHW loop orchestration#Charge end resets volume and requests a write]]
     #[test]
     fn live_tick_charge_end_resets_volume_and_requests_a_write() {
@@ -3076,6 +3349,99 @@ gap_dissolved = 2.0
         assert_eq!(s.t1_pre_draw, 48.5);
         assert_eq!(s.hwc_pre_draw, 44.5);
         assert!(!s.hwc_crash_detected);
+    }
+
+    // @lat: [[tests#DHW loop orchestration#Draw flow at the exact threshold does not start a draw]]
+    #[test]
+    fn live_tick_draw_flow_at_exact_threshold_does_not_start_a_draw() {
+        let cfg = test_cfg();
+        let mut s = test_state();
+        s.drawing = false;
+        s.hwc_crash_detected = true;
+        s.charge_end_time = Some(Instant::now() - Duration::from_secs(3600));
+        s.t1_at_charge_end = 50.0;
+        s.effective_t1 = 50.0;
+
+        let original_remaining = s.remaining;
+        let original_t1_pre_draw = s.t1_pre_draw;
+        let original_hwc_pre_draw = s.hwc_pre_draw;
+        let volume_at_reset = s.volume_at_reset;
+        let should_write = apply_live_dhw_tick(
+            &mut s,
+            &cfg,
+            LiveDhwTick {
+                charging: false,
+                volume_now: volume_at_reset,
+                t1_now: 48.5,
+                hwc_now: 44.5,
+                dhw_flow: cfg.draw_flow_min,
+            },
+        );
+
+        assert!(!should_write);
+        assert!(!s.drawing);
+        assert!(s.hwc_crash_detected);
+        assert_eq!(s.remaining, original_remaining);
+        assert_eq!(s.t1_pre_draw, original_t1_pre_draw);
+        assert_eq!(s.hwc_pre_draw, original_hwc_pre_draw);
+        assert!(s.effective_t1 < 50.0, "standby decay should still run when not drawing");
+    }
+
+    // @lat: [[tests#DHW loop orchestration#Draw start with volume advance requests a write]]
+    #[test]
+    fn live_tick_draw_start_with_volume_advance_requests_a_write() {
+        let cfg = test_cfg();
+        let mut s = test_state();
+        s.drawing = false;
+        s.volume_at_reset = 1000.0;
+        s.remaining = 177.0;
+
+        let should_write = apply_live_dhw_tick(
+            &mut s,
+            &cfg,
+            LiveDhwTick {
+                charging: false,
+                volume_now: 1012.0,
+                t1_now: 48.5,
+                hwc_now: 44.5,
+                dhw_flow: cfg.draw_flow_min + 5.0,
+            },
+        );
+
+        assert!(should_write);
+        assert!(s.drawing);
+        assert_eq!(s.t1_pre_draw, 48.5);
+        assert_eq!(s.hwc_pre_draw, 44.5);
+        assert!(s.remaining < 177.0);
+    }
+
+    // @lat: [[tests#DHW loop orchestration#Active draw skips standby decay]]
+    #[test]
+    fn live_tick_active_draw_skips_standby_decay() {
+        let cfg = test_cfg();
+        let mut s = test_state();
+        s.drawing = true;
+        s.charge_end_time = Some(Instant::now() - Duration::from_secs(3 * 3600));
+        s.t1_at_charge_end = 50.0;
+        s.effective_t1 = 50.0;
+        s.volume_at_reset = 1000.0;
+        s.remaining = 150.0;
+
+        let should_write = apply_live_dhw_tick(
+            &mut s,
+            &cfg,
+            LiveDhwTick {
+                charging: false,
+                volume_now: 1005.0,
+                t1_now: 49.0,
+                hwc_now: 46.0,
+                dhw_flow: cfg.draw_flow_min + 10.0,
+            },
+        );
+
+        assert!(should_write);
+        assert!(s.drawing);
+        assert_eq!(s.effective_t1, 50.0);
     }
 
     // @lat: [[tests#DHW loop orchestration#Draw end clears drawing and requests a write]]
@@ -3173,6 +3539,20 @@ gap_dissolved = 2.0
         let _ = server.await;
     }
 
+    #[tokio::test]
+    async fn heating_status_transport_failures_omit_ok_false() {
+        let _guard = heating_test_lock().lock().await;
+        let state = test_app_state(dead_test_pg());
+
+        let Json(resp) = api_heating_status(State(state)).await;
+
+        assert!(resp.get("ok").is_none(), "status should not include ok: {resp}");
+        assert!(
+            resp["error"].as_str().is_some(),
+            "status transport error missing: {resp}"
+        );
+    }
+
     // @lat: [[tests#Heating proxy#Heating mode and kill call their upstream POST endpoints]]
     #[tokio::test]
     async fn heating_mode_and_kill_call_their_upstream_post_endpoints() {
@@ -3252,6 +3632,85 @@ gap_dissolved = 2.0
 
         server.abort();
         let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn heating_mode_transport_failures_include_ok_false() {
+        let _guard = heating_test_lock().lock().await;
+        let state = test_app_state(dead_test_pg());
+
+        let Json(resp) = api_heating_mode(
+            State(state),
+            axum::extract::Path("comfort".to_string()),
+        )
+        .await;
+
+        assert_eq!(resp["ok"], serde_json::json!(false));
+        assert!(resp["error"].as_str().is_some(), "mode transport error missing: {resp}");
+    }
+
+    #[tokio::test]
+    async fn heating_away_invalid_json_keeps_ok_false_error_shape() {
+        let _guard = heating_test_lock().lock().await;
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let server = spawn_heating_invalid_json_server(requests.clone()).await;
+        let state = test_app_state(dead_test_pg());
+        let body = serde_json::json!({"until": "2026-04-11T18:30:00Z", "reason": "school run"});
+
+        let Json(resp) = api_heating_away(State(state), Json(body.clone())).await;
+
+        assert_eq!(resp["ok"], serde_json::json!(false));
+        assert!(resp["error"].as_str().is_some(), "away error text missing: {resp}");
+        assert_eq!(
+            requests.lock().expect("recorded requests mutex").as_slice(),
+            &[("POST /mode/away".to_string(), Some(body))]
+        );
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn heating_away_transport_failures_include_ok_false() {
+        let _guard = heating_test_lock().lock().await;
+        let state = test_app_state(dead_test_pg());
+        let body = serde_json::json!({"until": "2026-04-11T18:30:00Z"});
+
+        let Json(resp) = api_heating_away(State(state), Json(body)).await;
+
+        assert_eq!(resp["ok"], serde_json::json!(false));
+        assert!(resp["error"].as_str().is_some(), "away transport error missing: {resp}");
+    }
+
+    #[tokio::test]
+    async fn heating_kill_invalid_json_keeps_ok_false_error_shape() {
+        let _guard = heating_test_lock().lock().await;
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let server = spawn_heating_invalid_json_server(requests.clone()).await;
+        let state = test_app_state(dead_test_pg());
+
+        let Json(resp) = api_heating_kill(State(state)).await;
+
+        assert_eq!(resp["ok"], serde_json::json!(false));
+        assert!(resp["error"].as_str().is_some(), "kill error text missing: {resp}");
+        assert_eq!(
+            requests.lock().expect("recorded requests mutex").as_slice(),
+            &[("POST /kill".to_string(), None)]
+        );
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn heating_kill_transport_failures_include_ok_false() {
+        let _guard = heating_test_lock().lock().await;
+        let state = test_app_state(dead_test_pg());
+
+        let Json(resp) = api_heating_kill(State(state)).await;
+
+        assert_eq!(resp["ok"], serde_json::json!(false));
+        assert!(resp["error"].as_str().is_some(), "kill transport error missing: {resp}");
     }
 
     // ── HTTP handler tests ───────────────────────────────────────────────
@@ -3516,6 +3975,18 @@ gap_dissolved = 2.0
         let _ = ebusd.await;
     }
 
+    // @lat: [[tests#HTTP API#DHW boost transport failures include ok false and error text]]
+    #[tokio::test]
+    async fn dhw_boost_transport_failures_include_ok_false_and_error_text() {
+        let _guard = dhw_http_test_lock().lock().await;
+        let state = test_app_state(dead_test_pg());
+
+        let Json(resp) = api_dhw_boost(State(state)).await;
+
+        assert_eq!(resp["ok"], serde_json::json!(false));
+        assert!(resp["error"].as_str().is_some_and(|s| !s.is_empty()));
+    }
+
     // @lat: [[tests#HTTP API#DHW status combines ebusd and database readings into one snapshot]]
     #[tokio::test]
     async fn dhw_status_combines_ebusd_and_db_readings_into_one_snapshot() {
@@ -3588,6 +4059,58 @@ gap_dissolved = 2.0
                 "target_temp": 0.0,
             })
         );
+    }
+
+    // @lat: [[tests#HTTP API#DHW status malformed numeric replies default only the affected fields]]
+    #[tokio::test]
+    async fn dhw_status_malformed_numeric_replies_default_only_the_affected_fields() {
+        let _guard = dhw_http_test_lock().lock().await;
+        let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let responses = Arc::new(std::collections::HashMap::from([
+            ("read -f -c 700 HwcSFMode".to_string(), "auto".to_string()),
+            (
+                "read -f -c hmu Status01".to_string(),
+                "55.0;38.5;10.0;60.0;48.2;off".to_string(),
+            ),
+            (
+                "read -f -c 700 HwcTempDesired".to_string(),
+                "not-a-number".to_string(),
+            ),
+            (
+                "read -f -c 700 HwcStorageTemp".to_string(),
+                "bad-temp".to_string(),
+            ),
+        ]));
+        let ebusd = spawn_ebusd_test_server(responses, commands.clone()).await;
+        let pg = Arc::new(FakePg::default().with_query_result(
+            "SELECT dhw_t1, time FROM multical \
+             WHERE time >= now() - interval '1 hour' \
+             ORDER BY time DESC LIMIT 1",
+            49.75,
+            "2026-04-11T11:15:00Z",
+        ));
+        let state = test_app_state(pg);
+
+        let Json(resp) = api_dhw_status(State(state)).await;
+
+        assert_eq!(resp["ok"], serde_json::json!(true));
+        assert_eq!(resp["charging"], serde_json::json!(false));
+        assert_eq!(resp["sfmode"], serde_json::json!("auto"));
+        assert_eq!(resp["t1_hot"], serde_json::json!(49.75));
+        assert_eq!(resp["return_temp"], serde_json::json!(38.5));
+        assert_eq!(resp["target_temp"], serde_json::json!(0.0));
+        assert_eq!(resp["cylinder_temp"], serde_json::json!(0.0));
+        assert_eq!(
+            commands.lock().expect("recorded commands mutex").as_slice(),
+            &[
+                "read -f -c 700 HwcSFMode".to_string(),
+                "read -f -c hmu Status01".to_string(),
+                "read -f -c 700 HwcTempDesired".to_string(),
+                "read -f -c 700 HwcStorageTemp".to_string(),
+            ]
+        );
+
+        let _ = ebusd.await;
     }
 
     // ── Motion automation tests ─────────────────────────────────────────
@@ -3669,6 +4192,37 @@ gap_dissolved = 2.0
             zs.get("top_landing"),
             Some(&serde_json::json!({"state": "ON", "brightness": 180}))
         );
+    }
+
+    // @lat: [[tests#HTTP API#Malformed Zigbee JSON leaves cached state unchanged]]
+    #[tokio::test]
+    async fn malformed_zigbee_json_leaves_cached_state_unchanged() {
+        let state = test_automation_state();
+        let (cmd_tx, mut cmd_rx) = broadcast::channel(8);
+        let z2m_state = Arc::new(Mutex::new(std::collections::HashMap::from([(
+            "top_landing".to_string(),
+            serde_json::json!({"state": "ON", "brightness": 180}),
+        )])));
+
+        {
+            let mut s = state.lock().await;
+            s.suppressed_until = Some(tokio::time::Instant::now() + Duration::from_secs(30));
+        }
+
+        handle_z2m_message("not-json", &state, &cmd_tx, &z2m_state).await;
+
+        assert!(cmd_rx.try_recv().is_err());
+        let zs = z2m_state.lock().await;
+        assert_eq!(
+            zs.get("top_landing"),
+            Some(&serde_json::json!({"state": "ON", "brightness": 180}))
+        );
+        drop(zs);
+
+        let s = state.lock().await;
+        assert!(s.suppressed_until.is_some());
+        assert!(s.lights_off_at.is_none());
+        assert!(s.illuminance.is_empty());
     }
 
     // @lat: [[tests#Motion lighting automation#Dark motion turns on both motion lights and arms the timer]]
@@ -3844,6 +4398,35 @@ gap_dissolved = 2.0
         );
     }
 
+    // @lat: [[tests#Motion lighting automation#Non boolean occupancy refreshes lux without switching lights]]
+    #[tokio::test]
+    async fn non_boolean_occupancy_refreshes_lux_without_switching_lights() {
+        let state = test_automation_state();
+        let (cmd_tx, mut cmd_rx) = broadcast::channel(8);
+        let z2m_state = Arc::new(Mutex::new(std::collections::HashMap::new()));
+
+        handle_z2m_message(
+            r#"{"topic":"hall_motion","payload":{"occupancy":"true","illuminance":2.5}}"#,
+            &state,
+            &cmd_tx,
+            &z2m_state,
+        )
+        .await;
+
+        assert!(cmd_rx.try_recv().is_err());
+
+        let s = state.lock().await;
+        assert!(s.lights_off_at.is_none());
+        assert_eq!(s.illuminance.get("hall_motion"), Some(&2.5));
+        drop(s);
+
+        let zs = z2m_state.lock().await;
+        assert_eq!(
+            zs.get("hall_motion"),
+            Some(&serde_json::json!({"occupancy": "true", "illuminance": 2.5}))
+        );
+    }
+
     // @lat: [[tests#Motion lighting automation#Active timer motion keeps the pre light lux sample]]
     #[tokio::test]
     async fn active_timer_motion_keeps_the_pre_light_lux_sample() {
@@ -3894,6 +4477,32 @@ gap_dissolved = 2.0
         let s = state.lock().await;
         assert!(s.lights_off_at.is_none());
         assert!(s.suppressed_until.is_some());
+    }
+
+    // @lat: [[tests#Motion lighting automation#Motion light off while timer is idle does not suppress automation]]
+    #[tokio::test]
+    async fn motion_light_off_while_timer_is_idle_does_not_suppress_automation() {
+        let state = test_automation_state();
+        let (cmd_tx, mut cmd_rx) = broadcast::channel(8);
+        let z2m_state = Arc::new(Mutex::new(std::collections::HashMap::new()));
+
+        handle_z2m_message(
+            r#"{"topic":"hall","payload":{"state":"OFF"}}"#,
+            &state,
+            &cmd_tx,
+            &z2m_state,
+        )
+        .await;
+
+        assert!(cmd_rx.try_recv().is_err());
+
+        let s = state.lock().await;
+        assert!(s.lights_off_at.is_none());
+        assert!(s.suppressed_until.is_none());
+        drop(s);
+
+        let zs = z2m_state.lock().await;
+        assert_eq!(zs.get("hall"), Some(&serde_json::json!({"state": "OFF"})));
     }
 
     // @lat: [[tests#Motion lighting automation#Non motion light off does not suppress automation]]
@@ -4015,6 +4624,61 @@ gap_dissolved = 2.0
         let s = state.lock().await;
         assert!(s.suppressed_until.is_none());
         assert!(s.lights_off_at.is_some());
+    }
+
+    // @lat: [[tests#Motion lighting automation#Timer expiry at the exact deadline turns both lights off once]]
+    #[tokio::test(start_paused = true)]
+    async fn timer_expiry_at_the_exact_deadline_turns_both_lights_off_once() {
+        let state = test_automation_state();
+        {
+            let mut s = state.lock().await;
+            s.lights_off_at = Some(tokio::time::Instant::now() + Duration::from_secs(1));
+        }
+        let (cmd_tx, mut cmd_rx) = broadcast::channel(8);
+
+        let timer_task = tokio::spawn(timer_loop(state.clone(), cmd_tx));
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            cmd_rx.try_recv().expect("first OFF command").topic,
+            "landing/set"
+        );
+        assert_eq!(
+            cmd_rx.try_recv().expect("second OFF command").topic,
+            "hall/set"
+        );
+        assert!(cmd_rx.try_recv().is_err());
+
+        let s = state.lock().await;
+        assert!(s.lights_off_at.is_none());
+        assert!(s.suppressed_until.is_none());
+        drop(s);
+
+        timer_task.abort();
+        let _ = timer_task.await;
+    }
+
+    // @lat: [[tests#Motion lighting automation#Idle timer loop publishes nothing]]
+    #[tokio::test(start_paused = true)]
+    async fn idle_timer_loop_publishes_nothing() {
+        let state = test_automation_state();
+        let (cmd_tx, mut cmd_rx) = broadcast::channel(8);
+
+        let timer_task = tokio::spawn(timer_loop(state.clone(), cmd_tx));
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(3)).await;
+        tokio::task::yield_now().await;
+
+        assert!(cmd_rx.try_recv().is_err());
+        let s = state.lock().await;
+        assert!(s.lights_off_at.is_none());
+        assert!(s.suppressed_until.is_none());
+        drop(s);
+
+        timer_task.abort();
+        let _ = timer_task.await;
     }
 
     // @lat: [[tests#Motion lighting automation#Timer expiry off does not create manual suppression]]
@@ -4225,6 +4889,46 @@ gap_dissolved = 2.0
 
                 prop_assert!(s.effective_t1 <= t1_end,
                     "effective_t1 {} > t1_at_charge_end {}", s.effective_t1, t1_end);
+            }
+
+            /// Draw tracking never increases remaining litres
+            // @lat: [[tests#DHW draw tracking#Remaining never increases during a draw]]
+            #[test]
+            fn draw_tracking_remaining_never_increases(
+                cfg in arb_cfg(),
+                full in 100.0..300.0_f64,
+                remaining in 0.0..300.0_f64,
+                volume_at_reset in 0.0..10000.0_f64,
+                volume_advance in 0.1..200.0_f64,
+                t1_pre in 35.0..60.0_f64,
+                t1_drop in -5.0..5.0_f64,
+                hwc_pre in 30.0..55.0_f64,
+                hwc_drop in -5.0..10.0_f64,
+                drawing in proptest::bool::ANY,
+                hwc_crash_detected in proptest::bool::ANY,
+            ) {
+                let mut cfg = cfg;
+                cfg.full_litres = full;
+                let remaining = remaining.min(full);
+
+                let mut s = test_state();
+                s.full_litres = full;
+                s.remaining = remaining;
+                s.volume_at_reset = volume_at_reset;
+                s.drawing = drawing;
+                s.t1_pre_draw = t1_pre;
+                s.hwc_pre_draw = hwc_pre;
+                s.hwc_crash_detected = hwc_crash_detected;
+
+                let volume_now = volume_at_reset + volume_advance; // always > volume_at_reset
+                let t1_now = (t1_pre - t1_drop).max(0.0);
+                let hwc_now = (hwc_pre - hwc_drop).max(0.0);
+
+                apply_draw_tracking(&mut s, &cfg, volume_now, t1_now, hwc_now);
+
+                prop_assert!(s.remaining <= remaining,
+                    "remaining increased: before={remaining} after={} (volume_advance={volume_advance:.1}, t1_drop={t1_drop:.2}, hwc_drop={hwc_drop:.2}, drawing={drawing})",
+                    s.remaining);
             }
         }
     }

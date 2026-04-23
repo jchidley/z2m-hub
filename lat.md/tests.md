@@ -90,6 +90,22 @@ A T1 drop exactly equal to 1.5°C must not take the strict zero-litres branch; i
 
 When both the HwcStorage crash and severe T1-drop conditions happen in the same draw update, the stronger zero-litres T1 rule must win.
 
+### Hwc storage crash sets detected flag when remaining already within cap
+
+When the first HwcStorage crash fires but remaining litres are already within the cap, the crash must arm the detected flag without modifying remaining litres.
+
+### Severe T1 drop is idempotent when remaining is already zero
+
+When a severe T1 drop fires on a draw where remaining litres are already zero, the helper must keep remaining at zero rather than treating the no-op as an error or producing a negative value.
+
+### Moderate T1 drop does not raise remaining when already below twenty litres
+
+When a moderate T1 drop fires on a draw where remaining litres are already below twenty litres, the helper must leave remaining unchanged. The twenty-litre cap only lowers remaining; it must never raise it.
+
+### Remaining never increases during a draw
+
+For any valid state and any volume advance, calling the draw-tracking helper must never increase remaining litres. All cap branches only lower remaining; none may raise it regardless of temperature drop magnitude or crash detection state.
+
 ## DHW standby decay
 
 These specs cover how post-charge standby cooling adjusts effective top temperature without inventing or deleting volume.
@@ -112,7 +128,7 @@ A recent charge that is still above the reduced-temperature threshold must prese
 
 ### Decay never overwrites active charging states
 
-The elapsed-time standby rule must not overwrite active charging labels, because that would misreport a live charge as idle.
+Neither the elapsed-time standby rule nor the reduced-temperature standby rule may overwrite active charging labels, because that would misreport a live charge as idle.
 
 ### Effective top temperature never rises during standby
 
@@ -146,6 +162,10 @@ A motion-sensor report with `occupancy = false` may still refresh cached illumin
 
 A motion-sensor payload that carries only illuminance must update the cached lux sample while the timer is idle, but it must not be treated as motion or arm the shared timer.
 
+### Non boolean occupancy refreshes lux without switching lights
+
+If a motion-sensor payload carries an illuminance value but its `occupancy` field is not a JSON boolean, z2m-hub must still refresh the idle lux cache but must not treat that malformed occupancy value as motion or arm the timer.
+
 ### Active timer motion keeps the pre light lux sample
 
 While the shared timer is active, new motion reports must not overwrite the cached illuminance sample because that lux is contaminated by the automation's own light output.
@@ -153,6 +173,10 @@ While the shared timer is active, new motion reports must not overwrite the cach
 ### Manual off cancels the timer and suppresses retriggering
 
 When a motion-linked light reports `OFF` during an active timer, the automation must clear the timer and suppress fresh motion triggers for one timeout window.
+
+### Motion light off while timer is idle does not suppress automation
+
+A motion-linked light reporting `OFF` with no active timer must not arm manual-override suppression, because idle OFF confirmations are not evidence that the automation is currently being cancelled.
 
 ### Non motion light off does not suppress automation
 
@@ -169,6 +193,14 @@ While suppression is still active, dark occupancy events must not turn the motio
 ### Expired suppression is cleared before a fresh dark motion trigger
 
 Once the suppression deadline has passed, the next dark occupancy event must clear the stale suppression marker and behave like a normal trigger again.
+
+### Timer expiry at the exact deadline turns both lights off once
+
+When `Instant::now()` reaches `lights_off_at` exactly, the timer loop must treat that equality as expiry, clear the timer, and publish one OFF command for each motion light.
+
+### Idle timer loop publishes nothing
+
+When no shared off deadline is armed, timer-loop ticks must not publish OFF commands or invent suppression state.
 
 ### Timer expiry off does not create manual suppression
 
@@ -228,6 +260,16 @@ The one-shot DHW boost endpoint must return `{ "ok": true }` only when ebusd rep
 
 If ebusd accepts the boost command but returns an unexpected reply string, the endpoint must return `{ "ok": false, "error": ... }` carrying that reply so the dashboard gets a stable failure shape.
 
+### DHW boost transport failures include ok false and error text
+
+If the ebusd TCP request itself fails, the endpoint must still return `{ "ok": false, "error": ... }` with non-empty transport error text rather than panicking or claiming success.
+
+### DHW status malformed numeric replies default only the affected fields
+
+If ebusd returns malformed numeric text for `HwcTempDesired` or `HwcStorageTemp`, the live DHW-status endpoint must default only those fields to `0.0`.
+
+It must preserve other successfully read fields such as `sfmode`, parsed `return_temp`, charging state, and PostgreSQL `t1_hot`.
+
 ### Retained slashless Zigbee topics are cached for dashboard decisions
 
 When Zigbee2MQTT delivers a non-bridge topic without a slash, z2m-hub must cache that payload in `z2m_state` so later dashboard reads and toggle decisions can use it immediately.
@@ -239,6 +281,10 @@ Bridge topics and slash-containing topics such as command acknowledgements must 
 ### Retained slashless Zigbee topics overwrite older cached state
 
 When Zigbee2MQTT later replays or updates the same slashless device topic, z2m-hub must replace the cached payload so dashboard reads and toggle decisions use the latest state rather than stale retained data.
+
+### Malformed Zigbee JSON leaves cached state unchanged
+
+If a Zigbee2MQTT WebSocket frame is not valid `Z2mMessage` JSON, z2m-hub must ignore it completely rather than clearing or overwriting retained device state or mutating automation state.
 
 ## PostgreSQL interface
 
@@ -334,6 +380,18 @@ If the service restarts during an active charge, startup recovery must seed `t1_
 
 These specs cover the small pure orchestration helper that applies one live DHW polling tick to in-memory state.
 
+### Charge start captures T1 baseline and resets crossover tracking
+
+When a live tick sees idle transition to charging, it must snapshot the current `t1_now` as `t1_at_charge_start`, clear any stale crossover flag, enter `charging_below`, and avoid requesting a write before a completion event.
+
+### Crossover at the charge start threshold promotes uniform charging
+
+While charging is active, `hwc_now >= t1_at_charge_start` must mark crossover achieved and switch the state to `charging_uniform` even at exact equality, without forcing an immediate write.
+
+### Achieved crossover stays uniform for the rest of the charge
+
+Once a charging cycle has already marked crossover achieved, later charging ticks below the threshold must not clear the crossover flag or demote the state back to `charging_below` before charge completion.
+
 ### Charge end resets volume and requests a write
 
 When a live tick sees charging transition to idle, it must run charge completion, reset `volume_at_reset` to the current Multical register, clear any stale Hwc crash flag, and request persistence.
@@ -341,6 +399,18 @@ When a live tick sees charging transition to idle, it must run charge completion
 ### Draw start snapshots temperatures and clears prior crash state
 
 When draw flow crosses the active threshold, the live-tick helper must start draw tracking by snapshotting current T1/Hwc readings and clearing any prior crash flag.
+
+### Draw flow at the exact threshold does not start a draw
+
+A live tick with `dhw_flow == draw_flow_min` must not be treated as an active draw, because draw tracking only starts once flow exceeds the configured threshold.
+
+### Draw start with volume advance requests a write
+
+If draw flow crosses the active threshold and the Multical volume has already advanced past `volume_at_reset` on that tick, the helper must both enter drawing state and request persistence of the updated litres.
+
+### Active draw skips standby decay
+
+While a draw is active, the helper must not run standby cooling even if the tick is not charging, so draw tracking does not get mixed with idle cooling logic.
 
 ### Draw end clears drawing and requests a write
 
@@ -420,6 +490,10 @@ When a password is resolved from either supported source, `to_connection_string(
 
 When the credential file is present but trims to empty content, password resolution must ignore it and fall back to `PGPASSWORD` rather than returning an unusable blank password.
 
+### Missing systemd credential file falls back to PGPASSWORD
+
+When `$CREDENTIALS_DIRECTORY` is set but `pgpassword` is absent or unreadable there, password resolution must still fall back to `PGPASSWORD` rather than acting like a blank production credential was supplied.
+
 ### Connection string omits password when none resolved
 
 When no credential directory is set and no `PGPASSWORD` env var exists, `to_connection_string()` must not include a `password=` parameter.
@@ -465,6 +539,14 @@ The direct `HwcStorageTemp` helper must parse a numeric ebusd reply as `f64` and
 ### Charging helper treats either sfmode load or Status01 hwc as charging
 
 The direct charging helper must report charging when either `HwcSFMode` is `load` or `Status01` ends in `;hwc`, and report false only when both signals say idle.
+
+### eBUS command sends one newline-terminated request and trims the reply
+
+`ebusd_command` must send exactly `command + "\n"` on the TCP stream and trim trailing newline or surrounding whitespace from the reply before returning it to callers.
+
+### eBUS command closes the write side before waiting for the reply
+
+`ebusd_command` must half-close the TCP socket after sending the request so ebusd can detect end-of-request and reply on the same connection without waiting for more bytes.
 
 ## Real PostgreSQL integration
 
