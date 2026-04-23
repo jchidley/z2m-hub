@@ -42,6 +42,20 @@ Open actions that still affect migration completion:
 
 z2m-hub has no remaining repo-local runtime dependency on InfluxDB. The remaining migration blockers are shared-platform completion plus the last external consumer (`heatpump-analysis`).
 
+### Reviewed remaining Influx-only information in z2m-hub lat
+
+A repo-wide grep for `influx` / `InfluxDB` now finds only `lat.md/tsdb-migration.md`, `lat.md/infrastructure.md`, and the `[[tsdb-migration]]` backlink in `lat.md/lat.md`.
+
+| Location | Why it still exists | Required plan action |
+|---|---|---|
+| [[infrastructure#Hosts and roles]] | warns that any still-running InfluxDB v2 container on `pi5data` is temporary rather than part of the target architecture | after Phase 5, remove this temporary note so infrastructure only describes the steady state |
+| [[lat#z2m-hub#Knowledge map]] | keeps the migration tracker discoverable from the graph entrypoint while closeout is still in progress | when `[[tsdb-migration]]` is retired or reduced, update this backlink so the graph does not point at a stale migration node |
+| [[tsdb-migration#Historical read-parity note]] | keeps the old dual-read/parity sign-off as migration evidence | none; retain until broader migration closeout |
+| `pi5data:/usr/local/bin/z2m-hub.pre-pg-rollback.bak` | preserves the last pre-PostgreSQL rollback binary during the shared rollback window | remove after Phase 5 sign-off and explicit rollback-window close |
+| this file | acts as the repo-local closeout note while the shared migration is still open | retire or reduce to a backlink after shared closeout |
+
+No other repo-local lat sections describe InfluxDB as current runtime behaviour. No additional repo-local migration blocker was found beyond the shared Phase 5 work, the existing rollback-window cleanup, and the post-Phase-5 doc cleanup now called out below.
+
 ### Reviewed repo-local Influx-shaped artifacts
 
 The previous test-only line-protocol compatibility helper and its linked specs have now been removed.
@@ -53,11 +67,15 @@ z2m-hub no longer keeps repo-local Influx-shaped test artifacts. The remaining r
 
 This means the remaining migration blockers are fully outside this repo: shared-platform Phase 5 cleanup, the external rollback artifact on `pi5data`, and the last external consumer tracked in `energy-hub`.
 
-### Repo-local deletion candidates after Phase 5
+### Repo-local closeout actions after Phase 5
 
-After the shared tracker closes and the rollback window is explicitly over, the remaining repo-local cleanup deletions should be:
+After the shared tracker closes and the rollback window is explicitly over, the remaining repo-local cleanup actions should be:
 1. `pi5data`: remove `/usr/local/bin/z2m-hub.pre-pg-rollback.bak` after the final maintenance-window sign-off.
-2. `lat.md/tsdb-migration.md`: retire this file or reduce it to a short backlink once Phase 5 is complete and no closure notes still need to live here.
+2. `lat.md/infrastructure.md`: remove the temporary "if an InfluxDB v2 container still exists" note once Phase 5 has actually removed that container.
+3. `lat.md/tsdb-migration.md`: retire this file or reduce it to a short backlink once Phase 5 is complete and no closure notes still need to live here.
+4. `lat.md/lat.md`: if `[[tsdb-migration]]` stops being a first-class node, replace that knowledge-map entry with a shorter historical backlink or drop it entirely.
+
+These are closeout actions, not current blockers. They belong in the migration plan so the last Influx-era rollback artefacts do not become permanent background clutter after the shared cutover is declared done.
 
 Not deletion candidates: the PostgreSQL write-mapping tests, PostgreSQL write-failure tests, autoload bounds tests, startup reconstruction tests, and the live-PG verification specs. Those still describe the current PostgreSQL contract and restart-safety behaviour.
 
