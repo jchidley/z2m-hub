@@ -10,7 +10,7 @@ z2m-hub estimates remaining usable hot water by combining ebusd state, PostgreSQ
 
 The DHW loop polls all required signals every 10 seconds.
 
-The model reads charge state from eBUS, `HwcStorageTemp` from eBUS, and T1, draw flow, and cumulative volume from PostgreSQL. The shared state for this model lives in `DhwState`, while the highest-value state transitions now sit in small pure charge-completion and draw-tracking helpers that the loop calls after polling.
+The model reads charge state from eBUS, `HwcStorageTemp` from eBUS, and T1, draw flow, and cumulative volume from PostgreSQL. If the required Multical-backed volume/T1 snapshot is missing, the service marks the hot-water view as stale/unknown instead of presenting persisted litres as if they were live. The shared state for this model lives in `DhwState`, while the highest-value state transitions now sit in small pure charge-completion and draw-tracking helpers that the loop calls after polling.
 
 ## Charge detection
 
@@ -69,4 +69,4 @@ The runtime contract is one-way and defensive: a sane database recommendation ma
 
 A process restart must reconstruct DHW tracking from persisted PostgreSQL state without operator intervention.
 
-On startup, z2m-hub reloads the latest `remaining_litres` row from `dhw`, combines it with the current Multical cumulative volume register, and reconstructs `volume_at_reset` so draw tracking resumes from the right offset instead of treating the next shower as a fresh cylinder. If the persisted row is missing or unusable, the broader fail-safe contract from [[constraints#Restart recovery assumptions]] still applies: the model can fall back to safe defaults and recover from new live readings.
+On startup, z2m-hub reloads the latest `remaining_litres` row from `dhw`, combines it with the current Multical cumulative volume register, and reconstructs `volume_at_reset` so draw tracking resumes from the right offset instead of treating the next shower as a fresh cylinder. If startup cannot get a fresh enough Multical volume/T1 snapshot, it defers that offset reconstruction until fresh telemetry returns and keeps the dashboard in a stale/unknown state meanwhile. If the persisted row is missing or unusable, the broader fail-safe contract from [[constraints#Restart recovery assumptions]] still applies: the model can fall back to safe defaults and recover from new live readings.

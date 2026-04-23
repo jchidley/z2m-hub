@@ -242,6 +242,12 @@ If a cached light payload is present but the `state` field is missing or not the
 
 The hot-water endpoint must mirror the in-memory DHW snapshot fields needed by the dashboard, including litres, temperatures, charge state, and crossover flag.
 
+### Hot water endpoint marks Multical-backed values unknown when telemetry is stale
+
+If the DHW model has marked its Multical-backed inputs stale, the hot-water endpoint must expose that state instead of pretending the litres view is live.
+
+It must return `null` for Multical-derived fields such as remaining litres and top temperature, expose `multical_stale = true`, preserve still-live eBUS-backed `hwc_storage`, and carry the latest known Multical timestamp for the UI stale notice.
+
 ### DHW status combines ebusd and database readings into one snapshot
 
 The live DHW-status endpoint must merge ebusd mode/status reads with the latest PostgreSQL `dhw_t1` reading into one dashboard JSON snapshot.

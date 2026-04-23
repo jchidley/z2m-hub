@@ -284,6 +284,12 @@ struct DhwState {
     remaining: f64,
     /// Volume register at last charge completion (for tracking usage)
     volume_at_reset: f64,
+    /// Whether the Multical-backed inputs needed for litre reporting are stale
+    multical_stale: bool,
+    /// Latest observed Multical timestamp from the PostgreSQL polling helpers
+    multical_timestamp: String,
+    /// Whether startup still needs a fresh Multical snapshot before volume offset recovery
+    startup_recovery_pending: bool,
 
     // ── Crossover tracking ──
     /// T1 when charge started (the threshold HwcStorage must reach)
@@ -378,6 +384,9 @@ async fn main() {
         full_litres: config.dhw.full_litres,
         remaining: 0.0,
         volume_at_reset: 0.0,
+        multical_stale: true,
+        multical_timestamp: String::new(),
+        startup_recovery_pending: true,
         t1_at_charge_start: 0.0,
         crossover_achieved: false,
         t1_at_charge_end: 0.0,
@@ -455,13 +464,15 @@ async fn main() {
 async fn api_hot_water(State(state): State<AppState>) -> Json<serde_json::Value> {
     let dhw = state.dhw_state.lock().await;
     Json(serde_json::json!({
-        "remaining_litres": dhw.remaining,
+        "remaining_litres": if dhw.multical_stale { serde_json::Value::Null } else { serde_json::json!(dhw.remaining) },
         "full_litres": dhw.full_litres,
-        "effective_t1": dhw.effective_t1,
-        "charge_state": dhw.charge_state,
-        "crossover_achieved": dhw.crossover_achieved,
-        "t1": dhw.current_t1,
+        "effective_t1": if dhw.multical_stale { serde_json::Value::Null } else { serde_json::json!(dhw.effective_t1) },
+        "charge_state": if dhw.multical_stale { "unknown".to_string() } else { dhw.charge_state.to_string() },
+        "crossover_achieved": if dhw.multical_stale { serde_json::Value::Null } else { serde_json::json!(dhw.crossover_achieved) },
+        "t1": if dhw.multical_stale { serde_json::Value::Null } else { serde_json::json!(dhw.current_t1) },
         "hwc_storage": dhw.current_hwc,
+        "multical_stale": dhw.multical_stale,
+        "timestamp": if dhw.multical_timestamp.is_empty() { serde_json::Value::Null } else { serde_json::json!(dhw.multical_timestamp) },
         "ok": true
     }))
 }
@@ -887,17 +898,35 @@ async function updateHotWater() {
     const d = await r.json();
     if (!d.ok) return;
     if (d.full_litres) TANK_MAX = d.full_litres;
+    const litresEl = document.getElementById('litres');
+    const updatedEl = document.getElementById('hw-updated');
+    const waterEl = document.getElementById('water');
+    const el = document.getElementById('hw-status');
+
+    if (d.multical_stale) {
+      litresEl.textContent = '—';
+      waterEl.style.height = '0%';
+      waterEl.classList.remove('cool', 'warm');
+      el.textContent = 'Unknown';
+      el.className = 'hw-status low';
+      if (d.timestamp) {
+        const t = new Date(d.timestamp);
+        updatedEl.textContent = 'Multical stale since ' + t.toLocaleString();
+      } else {
+        updatedEl.textContent = 'Multical data unavailable';
+      }
+      return;
+    }
+
     const litres = Math.round(d.remaining_litres);
     const pct = Math.min(100, Math.max(0, (litres / TANK_MAX) * 100));
-    document.getElementById('litres').textContent = litres;
-    const waterEl = document.getElementById('water');
+    litresEl.textContent = litres;
     waterEl.style.height = pct + '%';
     // Colour by effective temperature: hot (≥42) → warm (38–42) → cool (<38)
     const et = d.effective_t1 || 0;
     waterEl.classList.remove('cool', 'warm');
     if (et > 0 && et < 38) waterEl.classList.add('cool');
     else if (et >= 38 && et < 42) waterEl.classList.add('warm');
-    const el = document.getElementById('hw-status');
     const cs = d.charge_state || '';
     if (cs === 'charging_below') { el.textContent = 'Heating below'; el.className = 'hw-status low'; }
     else if (cs === 'charging_uniform') { el.textContent = 'Heating uniformly'; el.className = 'hw-status ok'; }
@@ -908,11 +937,13 @@ async function updateHotWater() {
     else { el.textContent = 'Full'; el.className = 'hw-status full'; }
     // Stale indicator: standby with ~ prefix
     if (cs === 'standby' && litres > 0) {
-      document.getElementById('litres').textContent = '~' + litres;
+      litresEl.textContent = '~' + litres;
     }
     if (d.timestamp) {
       const t = new Date(d.timestamp);
-      document.getElementById('hw-updated').textContent = 'Updated ' + t.toLocaleTimeString();
+      updatedEl.textContent = 'Updated ' + t.toLocaleTimeString();
+    } else {
+      updatedEl.textContent = '';
     }
   } catch(e) { console.error(e); }
 }
@@ -1130,34 +1161,49 @@ async fn api_heating_kill(State(state): State<AppState>) -> Json<serde_json::Val
 
 // ── DHW tracking loop (physics-based model) ────────────────────────────────
 
-async fn get_current_volume(pg: &dyn PgAccess) -> f64 {
+async fn get_current_volume(pg: &dyn PgAccess) -> (f64, String) {
     pg.query_f64(
         "SELECT dhw_volume_v1, time FROM multical \
          WHERE time >= now() - interval '1 hour' \
          ORDER BY time DESC LIMIT 1",
     )
     .await
-    .0
 }
 
-async fn get_current_t1(pg: &dyn PgAccess) -> f64 {
+async fn get_current_t1(pg: &dyn PgAccess) -> (f64, String) {
     pg.query_f64(
         "SELECT dhw_t1, time FROM multical \
          WHERE time >= now() - interval '1 hour' \
          ORDER BY time DESC LIMIT 1",
     )
     .await
-    .0
 }
 
-async fn get_current_dhw_flow(pg: &dyn PgAccess) -> f64 {
+async fn get_current_dhw_flow(pg: &dyn PgAccess) -> (f64, String) {
     pg.query_f64(
         "SELECT dhw_flow, time FROM multical \
          WHERE time >= now() - interval '5 minutes' \
          ORDER BY time DESC LIMIT 1",
     )
     .await
-    .0
+}
+
+fn latest_multical_timestamp(timestamps: [&str; 3]) -> String {
+    timestamps
+        .into_iter()
+        .filter_map(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok())
+        .max()
+        .map(|ts| ts.with_timezone(&chrono::Utc).to_rfc3339())
+        .unwrap_or_default()
+}
+
+fn multical_snapshot_is_stale(volume_ts: &str, t1_ts: &str) -> bool {
+    volume_ts.is_empty() || t1_ts.is_empty()
+}
+
+fn update_multical_status(s: &mut DhwState, volume_ts: &str, t1_ts: &str, flow_ts: &str) {
+    s.multical_stale = multical_snapshot_is_stale(volume_ts, t1_ts);
+    s.multical_timestamp = latest_multical_timestamp([volume_ts, t1_ts, flow_ts]);
 }
 
 async fn get_hwc_storage_temp() -> f64 {
@@ -1406,6 +1452,7 @@ fn apply_startup_recovery(
     s.current_hwc = hwc_now;
     s.effective_t1 = t1_now;
     s.t1_at_charge_end = t1_now;
+    s.startup_recovery_pending = false;
     if charging {
         s.t1_at_charge_start = t1_now;
         s.charge_state = DhwChargeState::ChargingBelow;
@@ -1513,17 +1560,30 @@ async fn dhw_tracking_loop(
                  ORDER BY time DESC LIMIT 1",
             )
             .await;
-        let volume = get_current_volume(pg.as_ref()).await;
+        let (volume, volume_ts) = get_current_volume(pg.as_ref()).await;
         let charging = is_charging().await;
-        let t1 = get_current_t1(pg.as_ref()).await;
+        let (t1, t1_ts) = get_current_t1(pg.as_ref()).await;
+        let (dhw_flow, flow_ts) = get_current_dhw_flow(pg.as_ref()).await;
         let hwc = get_hwc_storage_temp().await;
 
         let mut s = state.lock().await;
-        apply_startup_recovery(&mut s, remaining, volume, charging, t1, hwc);
+        s.remaining = remaining;
+        s.current_hwc = hwc;
+        s.was_charging = charging;
+        update_multical_status(&mut s, &volume_ts, &t1_ts, &flow_ts);
+        if s.multical_stale {
+            s.startup_recovery_pending = true;
+            warn!(
+                "DHW init: Multical snapshot stale; startup recovery deferred until fresh volume/T1 telemetry returns"
+            );
+        } else {
+            apply_startup_recovery(&mut s, remaining, volume, charging, t1, hwc);
+        }
         info!(
             "DHW init: remaining={remaining:.1}L, full={:.0}L, volume={volume:.1}, \
-             T1={t1:.1}, HwcS={hwc:.1}, charging={charging}",
-            s.full_litres
+             T1={t1:.1}, flow={dhw_flow:.1}, HwcS={hwc:.1}, charging={charging}, multical_stale={}",
+            s.full_litres,
+            s.multical_stale
         );
     }
 
@@ -1531,16 +1591,31 @@ async fn dhw_tracking_loop(
     loop {
         interval.tick().await;
 
+        let charging = is_charging().await;
+        let (volume_now, volume_ts) = get_current_volume(pg.as_ref()).await;
+        let (t1_now, t1_ts) = get_current_t1(pg.as_ref()).await;
+        let hwc_now = get_hwc_storage_temp().await;
+        let (dhw_flow, flow_ts) = get_current_dhw_flow(pg.as_ref()).await;
         let tick = LiveDhwTick {
-            charging: is_charging().await,
-            volume_now: get_current_volume(pg.as_ref()).await,
-            t1_now: get_current_t1(pg.as_ref()).await,
-            hwc_now: get_hwc_storage_temp().await,
-            dhw_flow: get_current_dhw_flow(pg.as_ref()).await,
+            charging,
+            volume_now,
+            t1_now,
+            hwc_now,
+            dhw_flow,
         };
 
         let mut s = state.lock().await;
-        let should_write = apply_live_dhw_tick(&mut s, cfg, tick);
+        update_multical_status(&mut s, &volume_ts, &t1_ts, &flow_ts);
+        let should_write = if s.multical_stale {
+            s.current_hwc = hwc_now;
+            false
+        } else if s.startup_recovery_pending {
+            let remaining = s.remaining;
+            apply_startup_recovery(&mut s, remaining, volume_now, charging, t1_now, hwc_now);
+            false
+        } else {
+            apply_live_dhw_tick(&mut s, cfg, tick)
+        };
         if should_write {
             pg.write_dhw(&s).await;
         }
@@ -1761,6 +1836,9 @@ mod tests {
             full_litres: 177.0,
             remaining: 100.0,
             volume_at_reset: 0.0,
+            multical_stale: false,
+            multical_timestamp: "2026-01-01T00:00:00Z".to_string(),
+            startup_recovery_pending: false,
             t1_at_charge_start: 40.0,
             crossover_achieved: false,
             t1_at_charge_end: 50.0,
@@ -3056,9 +3134,9 @@ gap_dissolved = 2.0
                 ),
         );
 
-        assert_eq!(get_current_volume(fake_pg.as_ref()).await, 123.4);
-        assert_eq!(get_current_t1(fake_pg.as_ref()).await, 54.5);
-        assert_eq!(get_current_dhw_flow(fake_pg.as_ref()).await, 8.75);
+        assert_eq!(get_current_volume(fake_pg.as_ref()).await, (123.4, "2026-01-01T00:00:00Z".to_string()));
+        assert_eq!(get_current_t1(fake_pg.as_ref()).await, (54.5, "2026-01-01T00:00:00Z".to_string()));
+        assert_eq!(get_current_dhw_flow(fake_pg.as_ref()).await, (8.75, "2026-01-01T00:00:00Z".to_string()));
         assert_eq!(
             fake_pg.recorded_queries(),
             vec![
@@ -3083,9 +3161,9 @@ gap_dissolved = 2.0
     async fn dhw_polling_helpers_default_to_zero_when_postgres_returns_no_row() {
         let fake_pg = FakePg::default();
 
-        assert_eq!(get_current_volume(&fake_pg).await, 0.0);
-        assert_eq!(get_current_t1(&fake_pg).await, 0.0);
-        assert_eq!(get_current_dhw_flow(&fake_pg).await, 0.0);
+        assert_eq!(get_current_volume(&fake_pg).await, (0.0, String::new()));
+        assert_eq!(get_current_t1(&fake_pg).await, (0.0, String::new()));
+        assert_eq!(get_current_dhw_flow(&fake_pg).await, (0.0, String::new()));
     }
 
     // @lat: [[tests#PostgreSQL interface#Write failure does not stop the caller]]
@@ -3915,6 +3993,8 @@ gap_dissolved = 2.0
             dhw.current_hwc = 43.5;
             dhw.charge_state = DhwChargeState::Partial;
             dhw.crossover_achieved = false;
+            dhw.multical_stale = false;
+            dhw.multical_timestamp = "2026-04-23T08:30:00Z".to_string();
         }
 
         let Json(resp) = api_hot_water(State(state)).await;
@@ -3927,6 +4007,37 @@ gap_dissolved = 2.0
         assert_eq!(resp["crossover_achieved"], serde_json::json!(false));
         assert_eq!(resp["t1"], serde_json::json!(48.0));
         assert_eq!(resp["hwc_storage"], serde_json::json!(43.5));
+        assert_eq!(resp["multical_stale"], serde_json::json!(false));
+        assert_eq!(resp["timestamp"], serde_json::json!("2026-04-23T08:30:00Z"));
+    }
+
+    // @lat: [[tests#HTTP API#Hot water endpoint marks Multical-backed values unknown when telemetry is stale]]
+    #[tokio::test]
+    async fn hot_water_endpoint_marks_multical_values_unknown_when_telemetry_is_stale() {
+        let state = test_app_state(dead_test_pg());
+        {
+            let mut dhw = state.dhw_state.lock().await;
+            dhw.remaining = 91.5;
+            dhw.effective_t1 = 47.25;
+            dhw.current_t1 = 48.0;
+            dhw.current_hwc = 25.5;
+            dhw.charge_state = DhwChargeState::Partial;
+            dhw.crossover_achieved = true;
+            dhw.multical_stale = true;
+            dhw.multical_timestamp = "2026-04-16T10:08:50Z".to_string();
+        }
+
+        let Json(resp) = api_hot_water(State(state)).await;
+
+        assert_eq!(resp["ok"], serde_json::json!(true));
+        assert_eq!(resp["remaining_litres"], serde_json::Value::Null);
+        assert_eq!(resp["effective_t1"], serde_json::Value::Null);
+        assert_eq!(resp["t1"], serde_json::Value::Null);
+        assert_eq!(resp["crossover_achieved"], serde_json::Value::Null);
+        assert_eq!(resp["charge_state"], serde_json::json!("unknown"));
+        assert_eq!(resp["hwc_storage"], serde_json::json!(25.5));
+        assert_eq!(resp["multical_stale"], serde_json::json!(true));
+        assert_eq!(resp["timestamp"], serde_json::json!("2026-04-16T10:08:50Z"));
     }
 
     // @lat: [[tests#HTTP API#DHW boost returns ok true only for done]]
