@@ -13,7 +13,7 @@ This graph is the source of truth for current architecture, domain rules, and li
 - [[infrastructure]] records hosts, config ownership, and deployment shape.
 - [[constraints]] captures hard boundaries that should guide code changes.
 - [[tests]] records durable test specs and `@lat:` traceability anchors for high-value invariants.
-- [[tsdb-migration]] records the remaining shared completion work and repo-local closeout evidence for the InfluxDB-to-PostgreSQL migration.
+- [[tsdb-migration]] records the current migration state, the remaining shared completion work, and the repo-local backlog after migration.
 
 ## Reading order
 

@@ -36,6 +36,15 @@ Credentials must never be stored in TOML config files, command-line arguments, o
 
 For Pi/Linux services, the supported long-lived secret path is systemd encrypted credentials via `systemd-creds encrypt` and `LoadCredentialEncrypted=`. For trusted dev/test-machine use only, one-shot environment injection from `ak` is allowed. `LoadCredential=` from plaintext files is not allowed. This prevents accidental commits, world-readable files on disk, and secrets leaking into process listings. See [[infrastructure#Secret management]] for the implementation.
 
+## Timestamp semantics
+
+Most timestamps in this service are coarse event markers rather than exact physical sample times.
+
+- `multical` source data is 2s, the DHW model runs on 10s polling, and `dhw` persistence happens on state-change boundaries rather than every tick.
+- Host clock sync, polling jitter, network delay, and write-time stamping dominate any microsecond-looking digits, so sub-second precision should not be treated as physical truth by default.
+- Do not add a sub-second contract here unless a new feature genuinely depends on timing alignment and documents what the timestamp means.
+- The shared platform rationale, plus the electricity-monitoring exception for sub-second cross-board lag work, lives in `~/github/energy-hub/lat.md/infrastructure.md#Timestamp semantics and required precision`.
+
 ## Restart recovery assumptions
 
 The service accepts in-memory state loss on restart only because each subsystem has a recovery path.
