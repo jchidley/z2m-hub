@@ -86,7 +86,7 @@ After the shared tracker closes and the rollback window is explicitly over, the 
 3. `lat.md/tsdb-migration.md`: retire this file or reduce it to a short backlink once Phase 5 is complete and no closure notes still need to live here.
 4. `lat.md/lat.md`: if `[[tsdb-migration]]` stops being a first-class node, replace that knowledge-map entry with a shorter historical backlink or drop it entirely.
 
-These are closeout actions, not current blockers. They belong in the migration plan so the last Influx-era rollback artefacts do not become permanent background clutter after the shared cutover is declared done.
+These are closeout actions, not current blockers, but they are now an explicit deferred-work list rather than background cleanup. The intent is to delete each one deliberately after Phase 5 so the last Influx-era rollback artefacts do not become permanent background clutter.
 
 Not deletion candidates: the PostgreSQL write-mapping tests, PostgreSQL write-failure tests, autoload bounds tests, startup reconstruction tests, and the live-PG verification specs. Those still describe the current PostgreSQL contract and restart-safety behaviour.
 
