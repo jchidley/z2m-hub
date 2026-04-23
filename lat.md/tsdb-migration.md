@@ -35,21 +35,19 @@ The overall migration is not complete until the remaining shared InfluxDB retire
 Authoritative cross-repo tracker: `~/github/energy-hub/lat.md/tsdb-migration.md`
 
 Open actions that still affect migration completion:
-1. `heatpump-analysis`: finish its repo-local PostgreSQL migration, `adaptive-heating-mvp` cutover, and verification.
-2. pi5data Phase 5: retire Telegraf's `influxdb_v2` output.
-3. pi5data Phase 5: remove the Grafana v2 datasource.
-4. pi5data Phase 5: stop and remove the InfluxDB v2 container.
-5. pi5data Phase 5: archive the v2 data volume.
+1. pi5data Phase 5: retire Telegraf's `influxdb_v2` output.
+2. pi5data Phase 5: remove the Grafana v2 datasource.
+3. pi5data Phase 5: stop and remove the InfluxDB v2 container.
+4. pi5data Phase 5: archive the v2 data volume.
 
-Latest repo-local data review: `2026-04-23T10:01:11+00:00` (`now()` from TimescaleDB during this review).
+Latest repo-local data review: `2026-04-23T17:26:10+00:00` (`/api/hot-water` timestamp during this review, with matching fresh PostgreSQL rows and service checks).
 
 Status against those open items from the z2m-hub repo side:
-- item 1 remains open externally; no repo-local data from this review changed the `heatpump-analysis` gate
-- items 2–5 remain open externally; this repo still carries the temporary Phase-5 cleanup notes below, and the rollback binary on `pi5data` is still present
+- items 1–4 remain open externally; this repo still carries the temporary Phase-5 cleanup notes below, and the rollback binary on `pi5data` is still present
 
-The shared tracker in `~/github/energy-hub/lat.md/tsdb-migration.md` still shows the same gate: Phase 5 stays blocked on `heatpump-analysis` final parity / rollback sign-off, and the destructive cutover sequence itself belongs to `~/github/energy-hub/docs/timescaledb-cutover-runbook.md`.
+The shared tracker in `~/github/energy-hub/lat.md/tsdb-migration.md` now shows only the Phase 5 maintenance-window sequence on pi5data. `heatpump-analysis` is no longer an external blocker, and the destructive cutover sequence itself belongs to `~/github/energy-hub/docs/timescaledb-cutover-runbook.md`.
 
-z2m-hub has no remaining repo-local runtime dependency on InfluxDB. The remaining migration blockers are shared-platform completion plus the last external consumer (`heatpump-analysis`).
+z2m-hub has no remaining repo-local runtime dependency on InfluxDB. The remaining migration blockers are shared-platform completion and the explicit post-Phase-5 rollback/doc cleanup listed below.
 
 ### Reviewed remaining Influx-only information in z2m-hub lat
 
@@ -78,7 +76,7 @@ z2m-hub no longer keeps repo-local Influx-shaped test artifacts. The remaining r
 - [[tests#PostgreSQL interface]]
 - [[tests#Real PostgreSQL integration]]
 
-This means the remaining migration blockers are fully outside this repo: shared-platform Phase 5 cleanup, the external rollback artifact on `pi5data`, and the last external consumer tracked in `energy-hub`.
+This means the remaining migration blockers are fully outside this repo: shared-platform Phase 5 cleanup and the external rollback artifact on `pi5data`.
 
 ### Repo-local closeout actions after Phase 5
 
@@ -107,13 +105,13 @@ No further repo-local parity work is required unless the shared migration uncove
 
 The live PostgreSQL cutover still looks stable from the repo side.
 
-Latest re-check during this review (`2026-04-23T10:01:11+00:00` from TimescaleDB):
-- service status still shows the current hardening deploy on `pi5data` (`ExecMainPID=2695805`, `ActiveEnterTimestamp=Thu 2026-04-23 10:24:30 BST`, `SubState=running`)
-- journal output since that restart still shows a normal startup, one DHW-boost request, and no PostgreSQL transport or write errors
+Latest re-check during this review (`2026-04-23T17:26:10+00:00` from `/api/hot-water`):
+- service status still shows the current hardening deploy on `pi5data` (`ExecMainPID=2718212`, `ActiveEnterTimestamp=Thu 2026-04-23 11:14:04 BST`, `SubState=running`)
+- journal output since that restart still shows a normal startup and only expected DHW / motion entries, with no PostgreSQL transport or write errors
 - live API checks still returned sane payloads for `/api/hot-water`, `/api/dhw/status`, and `/api/lights`
-- the hot-water API remained live-backed during this review (`multical_stale = false`, `remaining_litres = 201.0`, `charge_state = "charging_uniform"`, `timestamp = "2026-04-23T10:00:50+00:00"`)
-- PostgreSQL `multical` ingest is fresh again, with the latest row at `2026-04-23 10:01:20+00` and `220` rows since the previous review restart timestamp (`2026-04-23T09:24:30+00:00`)
-- PostgreSQL `dhw` remains at `2026-04-23 08:52:49.577073+00`, but follow-up review showed this is currently expected rather than a write failure: Multical volume stayed flat at `105680.0003`, flow stayed `0`, and the code only persists on charge end, draw-volume advance, or draw end
+- the hot-water API remained live-backed during this review (`multical_stale = false`, `remaining_litres = 201.0`, `charge_state = "standby"`, `timestamp = "2026-04-23T17:26:10+00:00"`)
+- PostgreSQL `multical` ingest remained fresh, with recent shared-platform review showing current rows continuing to land through the active pi5data ingest path
+- PostgreSQL `dhw` latest row remained `2026-04-23 13:13:10+00`, which matches the accepted contract here: the model persists on charge end, draw-volume advance, or draw end rather than every polling tick
 - rollback artifact remained available at `/usr/local/bin/z2m-hub.pre-pg-rollback.bak` (`7.3M`)
 
 ## Verification commands
