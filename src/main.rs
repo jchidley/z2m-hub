@@ -246,6 +246,8 @@ struct AutomationState {
     suppressed_until: Option<Instant>,
     /// Last known illuminance per motion sensor
     illuminance: std::collections::HashMap<String, f64>,
+    /// Per-light grace window after an automation ON where OFF reports are treated as stale/failed confirmations
+    ignore_off_until: std::collections::HashMap<String, Instant>,
 }
 
 /// DHW charge/discharge state label
@@ -340,6 +342,7 @@ const Z2M_WS_URL: &str = "ws://emonpi:8080/api";
 const LIGHTS: &[&str] = &["landing", "hall", "top_landing"];
 const MOTION_LIGHTS: &[&str] = &["landing", "hall"];
 const OFF_DELAY: Duration = Duration::from_secs(300);
+const OFF_REPORT_GRACE: Duration = Duration::from_secs(2);
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 const HTTP_PORT: u16 = 3030;
 
@@ -361,6 +364,7 @@ async fn main() {
         lights_off_at: None,
         suppressed_until: None,
         illuminance: std::collections::HashMap::new(),
+        ignore_off_until: std::collections::HashMap::new(),
     }));
 
     // Channel for sending commands to Z2M
@@ -1807,6 +1811,7 @@ async fn handle_z2m_message(
                     } else {
                         let lux = s.illuminance.get(topic).copied().unwrap_or(0.0);
                         if lux <= threshold {
+                            let now = Instant::now();
                             info!("Motion on {topic} (lux={lux}, threshold={threshold}) — turning ON {MOTION_LIGHTS:?}");
 
                             for light in MOTION_LIGHTS {
@@ -1815,9 +1820,11 @@ async fn handle_z2m_message(
                                     payload: serde_json::json!({"state": "ON"}),
                                 };
                                 let _ = cmd_tx.send(on_msg);
+                                s.ignore_off_until
+                                    .insert((*light).to_string(), now + OFF_REPORT_GRACE);
                             }
 
-                            s.lights_off_at = Some(Instant::now() + OFF_DELAY);
+                            s.lights_off_at = Some(now + OFF_DELAY);
                             info!("Scheduled {MOTION_LIGHTS:?} OFF in {OFF_DELAY:?}");
                         } else {
                             info!("Motion on {topic} (lux={lux}, threshold={threshold}) — too bright, skipping");
@@ -1832,9 +1839,22 @@ async fn handle_z2m_message(
                 if state_val == "OFF" {
                     let mut s = state.lock().await;
                     if s.lights_off_at.is_some() {
-                        s.lights_off_at = None;
-                        s.suppressed_until = Some(Instant::now() + OFF_DELAY);
-                        info!("Manual OFF on {topic} — automation suppressed for {OFF_DELAY:?}");
+                        let now = Instant::now();
+                        if s.ignore_off_until
+                            .get(topic)
+                            .is_some_and(|ignore_until| now < *ignore_until)
+                        {
+                            info!("Ignoring early OFF on {topic} after automation ON; retrying ON");
+                            let on_msg = Z2mMessage {
+                                topic: format!("{topic}/set"),
+                                payload: serde_json::json!({"state": "ON"}),
+                            };
+                            let _ = cmd_tx.send(on_msg);
+                        } else {
+                            s.lights_off_at = None;
+                            s.suppressed_until = Some(now + OFF_DELAY);
+                            info!("Manual OFF on {topic} — automation suppressed for {OFF_DELAY:?}");
+                        }
                     }
                 }
             }
@@ -1898,6 +1918,7 @@ mod tests {
             lights_off_at: None,
             suppressed_until: None,
             illuminance: std::collections::HashMap::new(),
+            ignore_off_until: std::collections::HashMap::new(),
         }))
     }
 
@@ -4672,6 +4693,38 @@ gap_dissolved = 2.0
         let s = state.lock().await;
         assert!(s.lights_off_at.is_none());
         assert!(s.suppressed_until.is_some());
+    }
+
+    // @lat: [[tests#Motion lighting automation#Early OFF after automation ON is ignored and retried]]
+    #[tokio::test]
+    async fn early_off_after_automation_on_is_ignored_and_retried() {
+        let state = test_automation_state();
+        {
+            let mut s = state.lock().await;
+            s.lights_off_at = Some(tokio::time::Instant::now() + OFF_DELAY);
+            s.ignore_off_until.insert(
+                "landing".to_string(),
+                tokio::time::Instant::now() + OFF_REPORT_GRACE,
+            );
+        }
+        let (cmd_tx, mut cmd_rx) = broadcast::channel(8);
+        let z2m_state = Arc::new(Mutex::new(std::collections::HashMap::new()));
+
+        handle_z2m_message(
+            r#"{"topic":"landing","payload":{"state":"OFF"}}"#,
+            &state,
+            &cmd_tx,
+            &z2m_state,
+        )
+        .await;
+
+        let retry = cmd_rx.try_recv().expect("early OFF should trigger an ON retry");
+        assert_eq!(retry.topic, "landing/set");
+        assert_eq!(retry.payload, serde_json::json!({"state": "ON"}));
+
+        let s = state.lock().await;
+        assert!(s.lights_off_at.is_some());
+        assert!(s.suppressed_until.is_none());
     }
 
     // @lat: [[tests#Motion lighting automation#Motion light off while timer is idle does not suppress automation]]

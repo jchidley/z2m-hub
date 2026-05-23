@@ -174,6 +174,10 @@ While the shared timer is active, new motion reports must not overwrite the cach
 
 When a motion-linked light reports `OFF` during an active timer, the automation must clear the timer and suppress fresh motion triggers for one timeout window.
 
+### Early OFF after automation ON is ignored and retried
+
+An `OFF` report that arrives immediately after the automation sends an `ON` command is treated as stale or failed Zigbee feedback, so the timer stays armed, suppression is not set, and the affected light receives an ON retry.
+
 ### Motion light off while timer is idle does not suppress automation
 
 A motion-linked light reporting `OFF` with no active timer must not arm manual-override suppression, because idle OFF confirmations are not evidence that the automation is currently being cancelled.
@@ -312,7 +316,7 @@ When `ReconnectingPg` cannot establish a PostgreSQL session at all, its write pa
 
 The pure row-mapping helper feeding `write_dhw_to_pg` must project every persisted `dhw` column from `DhwState` with the expected PostgreSQL types and values, including `model_version = 2`.
 
-This replaces the old line-protocol compatibility check with an idiomatic PostgreSQL-first contract on the actual insert payload shape.
+This keeps the persistence contract PostgreSQL-first by testing the actual insert payload shape.
 
 ### Bottom zone hot threshold at thirty degrees
 

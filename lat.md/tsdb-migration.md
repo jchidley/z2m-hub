@@ -6,7 +6,7 @@ This file keeps only the current migration state, the actions still required to 
 
 The repo-local runtime cutover is complete, and the shared platform shutdown is complete too.
 
-z2m-hub already runs PostgreSQL-first in production, has no remaining repo-local runtime dependency on InfluxDB, and no longer depends on any live InfluxDB service on `pi5data`.
+z2m-hub already runs PostgreSQL-first in production and has no remaining repo-local alternative TSDB runtime path.
 
 ## Actions required to complete migration
 

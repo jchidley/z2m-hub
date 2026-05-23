@@ -32,7 +32,9 @@ The cached lux value updates only when the motion timer is idle. This avoids the
 
 A manual OFF during an active motion timer cancels the automation and suppresses retriggering for one full timeout window.
 
-When a motion-linked light reports `OFF` while the timer is active, the timer is cleared and suppression is set for another 300 seconds. Motion events during that window are ignored so the automation does not fight the user.
+When a motion-linked light reports `OFF` while the timer is active, the timer is normally cleared and suppression is set for another 300 seconds. Motion events during that window are ignored so the automation does not fight the user.
+
+There is one guard against false Zigbee feedback: for two seconds after the automation sends an ON command, an `OFF` report from that same light is treated as stale or failed confirmation, not a user override. The timer remains armed and the light receives an ON retry.
 
 ## Timer-driven off behaviour
 

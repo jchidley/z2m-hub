@@ -12,6 +12,8 @@ This graph is the source of truth for current architecture, domain rules, and li
 - [[interfaces]] defines HTTP, WebSocket, eBUS, PostgreSQL, and heating proxy contracts.
 - [[infrastructure]] records hosts, config ownership, and deployment shape.
 - [[constraints]] captures hard boundaries that should guide code changes.
+- [[plan]] tracks open operational work and the latest production data review.
+- [[reviews]] archives older production data reviews once a newer review replaces them in the plan.
 - [[tests]] records durable test specs and `@lat:` traceability anchors for high-value invariants.
 - [[tsdb-migration]] records the migration completion note and any remaining repo-local cleanup backlog.
 
